@@ -1,0 +1,15 @@
+services:
+  telegram-115-bot:
+    build: .
+    container_name: telegram-115-bot
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      HTTP_PROXY: http://127.0.0.1:7890
+      HTTPS_PROXY: http://127.0.0.1:7890
+      NO_PROXY: localhost,127.0.0.1,::1,.115.com
+      BOT_CONFIG: /app/config/config.yaml
+    volumes:
+      - ./config:/app/config
+      - ./tmp:/app/tmp
+      - ./downloads:/downloads

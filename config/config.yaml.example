@@ -1,0 +1,45 @@
+bot_token: your_bot_token
+allowed_user: "123456789"
+bot_name: "@your_bot_name"
+tg_api_id: 123456
+tg_api_hash: your_tg_api_hash
+
+115_app_id: ""
+access_token: your_access_token
+refresh_token: your_refresh_token
+
+category_folder:
+  - name: movies
+    display_name: 电影
+    path_map:
+      - name: 外语电影
+        path: /影视/电影/外语电影
+      - name: 华语电影
+        path: /影视/电影/华语电影
+  - name: av
+    display_name: 漫威
+    path_map:
+      - name: 码の谜
+        path: /漫威/有码
+      - name: 祼の真
+        path: /漫威/无码
+
+proxy:
+  http: http://127.0.0.1:7890
+  https: http://127.0.0.1:7890
+  no_proxy: localhost,127.0.0.1,::1,.115.com
+
+offline:
+  poll_interval: 10
+  timeout: 900
+
+aria2:
+  enable: true
+  host: http://127.0.0.1
+  port: 6800
+  rpc_secret: ""
+  download_path: /downloads
+  poll_interval: 5
+
+upload:
+  temp_dir: ./tmp

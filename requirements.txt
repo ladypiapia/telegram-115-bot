@@ -1,0 +1,9 @@
+alibabacloud_oss_v2==1.1.2
+aria2p==0.12.1
+beautifulsoup4>=4.13.5
+PySocks==1.7.1
+PyYAML>=6.0.2
+python-telegram-bot==22.3
+qrcode==8.2
+requests==2.32.5
+telethon[cryptg]==1.40.0
