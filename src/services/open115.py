@@ -290,19 +290,41 @@ class Open115Client:
         if payload.get("state") is not True:
             raise RuntimeError(f"115 add offline task failed: {payload}")
 
-    def list_offline_tasks(self) -> list[OfflineTaskInfo]:
+    def list_offline_tasks(self, max_pages: int | None = None) -> list[OfflineTaskInfo]:
         first_page = self._request("GET", f"{self.base_url}/open/offline/get_task_list")
         if first_page.get("code") != 0:
             raise RuntimeError(f"115 get offline tasks failed: {first_page}")
 
         tasks: list[OfflineTaskInfo] = []
         total_pages = int((first_page.get("data") or {}).get("page_count", 1))
-        for page in range(1, total_pages + 1):
-            payload = self._request(
-                "GET",
-                f"{self.base_url}/open/offline/get_task_list",
-                params={"page": page},
+        if max_pages is not None:
+            total_pages = min(total_pages, max_pages)
+
+        first_page_data = first_page.get("data") or {}
+        for task in first_page_data.get("tasks", []):
+            tasks.append(
+                OfflineTaskInfo(
+                    name=task.get("name", ""),
+                    url=task.get("url", ""),
+                    info_hash=task.get("info_hash", ""),
+                    file_id=str(task.get("file_id", "")),
+                    status=int(task.get("status", 0)),
+                    percent_done=int(task.get("percentDone", 0)),
+                )
             )
+
+        for page in range(2, total_pages + 1):
+            try:
+                payload = self._request(
+                    "GET",
+                    f"{self.base_url}/open/offline/get_task_list",
+                    params={"page": page},
+                )
+            except requests.HTTPError as exc:
+                status_code = getattr(exc.response, "status_code", None)
+                if status_code == 405:
+                    break
+                raise
             data = payload.get("data") or {}
             for task in data.get("tasks", []):
                 tasks.append(
@@ -320,7 +342,7 @@ class Open115Client:
     def wait_offline_complete(self, magnet: str, timeout: int, interval: int) -> OfflineTaskInfo:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for task in self.list_offline_tasks():
+            for task in self.list_offline_tasks(max_pages=3):
                 if task.url != magnet:
                     continue
                 if task.status == 2 or task.percent_done >= 100:

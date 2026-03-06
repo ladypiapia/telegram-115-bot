@@ -2,6 +2,7 @@ services:
   telegram-115-bot:
     build: .
     container_name: telegram-115-bot
+    network_mode: host
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
