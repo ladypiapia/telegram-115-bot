@@ -23,7 +23,7 @@ from src.services.task_flow import MessageRef, TaskFlowService
 HELP_TEXT = """可用命令：
 /start - 查看帮助
 /auth - 115 二维码授权
-/av <番号> - 搜索磁力并自动下载
+/av - 输入番号后搜索并选择资源下载
 /q - 取消当前目录选择
 
 直接发送 magnet 链接会进入 115 离线下载流程。
@@ -38,7 +38,7 @@ def register_handlers(application: Application, settings: Settings, flow: TaskFl
     application.add_handler(CommandHandler("auth", auth))
     application.add_handler(CommandHandler("av", av))
     application.add_handler(CommandHandler("q", cancel))
-    application.add_handler(CallbackQueryHandler(selection_callback, pattern=r"^(selm|sell|sellast|selc):"))
+    application.add_handler(CallbackQueryHandler(selection_callback, pattern=r"^(selm|sell|sellast|selc|avr):"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, media_message))
 
@@ -58,7 +58,7 @@ def build_bot_commands() -> list[BotCommand]:
     return [
         BotCommand("start", "查看帮助"),
         BotCommand("auth", "115 授权"),
-        BotCommand("av", "番号搜索并下载"),
+        BotCommand("av", "输入番号后搜索资源"),
         BotCommand("q", "取消当前选择"),
     ]
 
@@ -103,21 +103,11 @@ async def av(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _is_allowed(update, context):
         return
     flow: TaskFlowService = context.application.bot_data["flow"]
-    if not context.args:
-        await _reply_text_with_retry(update.effective_message, "请使用 /av <番号>。")
+    flow.begin_av_input(chat_id=update.effective_chat.id, user_id=update.effective_user.id)
+    if context.args:
+        await _reply_text_with_retry(update.effective_message, "请直接发送番号，不要使用 /av + 番号。")
         return
-    query = " ".join(context.args).strip()
-    selection = flow.create_selection(
-        chat_id=update.effective_chat.id,
-        user_id=update.effective_user.id,
-        kind="av",
-        payload={"query": query},
-    )
-    await _reply_text_with_retry(
-        update.effective_message,
-        f"请为 {query} 选择 115 保存目录。",
-        reply_markup=flow.build_main_keyboard(selection),
-    )
+    await _reply_text_with_retry(update.effective_message, "请输入番号。")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -133,6 +123,22 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     text = (update.effective_message.text or "").strip()
     flow: TaskFlowService = context.application.bot_data["flow"]
+    if flow.consume_av_input(chat_id=update.effective_chat.id, user_id=update.effective_user.id):
+        if not text:
+            await _reply_text_with_retry(update.effective_message, "番号不能为空，请重新发送 /av。")
+            return
+        selection = flow.create_selection(
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            kind="av",
+            payload={"query": text},
+        )
+        await _reply_text_with_retry(
+            update.effective_message,
+            f"请为 {text} 选择 115 保存目录。",
+            reply_markup=flow.build_main_keyboard(selection),
+        )
+        return
     if not flow.is_magnet(text):
         return
     selection = flow.create_selection(
@@ -230,6 +236,35 @@ async def selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text("目录选择已失效，请重新发起。")
             return
         await _dispatch_selection(query, flow, selection, save_path)
+        return
+
+    if action == "avr":
+        option_id = payload[2]
+        try:
+            result = flow.resolve_av_result(selection, option_id)
+        except KeyError:
+            await query.edit_message_text("资源选择已失效，请重新搜索。")
+            return
+        save_path = selection.payload["save_path"]
+        flow.last_save_path[selection.chat_id] = save_path
+        flow.pop_selection(selection.selection_id)
+        await query.edit_message_text(
+            (
+                "AV 任务已提交。\n"
+                f"名称: {result.title}\n"
+                f"热度: {result.hotness or '-'}\n"
+                f"文件大小: {result.size or '-'}\n"
+                f"创建时间: {result.created_at or '-'}\n"
+                f"保存目录: {save_path}"
+            )
+        )
+        await flow.start_magnet_task(
+            chat_id=selection.chat_id,
+            user_id=selection.user_id,
+            magnet=result.magnet,
+            save_path=save_path,
+            label=result.title,
+        )
 
 
 async def _dispatch_selection(query, flow: TaskFlowService, selection, save_path: str) -> None:
@@ -248,12 +283,29 @@ async def _dispatch_selection(query, flow: TaskFlowService, selection, save_path
         return
     if selection.kind == "av":
         query_text = selection.payload["query"]
-        await query.edit_message_text(f"/av 任务已提交。\n保存目录: {save_path}")
-        await flow.start_av_task(
+        await query.edit_message_text(f"正在搜索 {query_text} 的资源...\n保存目录: {save_path}")
+        try:
+            results = await flow.search_av_results(query_text, limit=10)
+        except Exception as exc:
+            await query.edit_message_text(f"/av 搜索失败: {exc}")
+            return
+        if not results:
+            await query.edit_message_text(f"没有找到 {query_text} 的可用磁力。")
+            return
+
+        result_selection = flow.create_selection(
             chat_id=selection.chat_id,
             user_id=selection.user_id,
-            query=query_text,
-            save_path=save_path,
+            kind="av-result",
+            payload={"query": query_text, "save_path": save_path},
+        )
+        await query.edit_message_text(
+            (
+                f"找到 {min(len(results), 10)} 条资源，请点击要保存到 115 的结果。\n"
+                f"搜索词: {query_text}\n"
+                f"保存目录: {save_path}"
+            ),
+            reply_markup=flow.build_av_result_keyboard(result_selection, results),
         )
         return
     if selection.kind == "upload":

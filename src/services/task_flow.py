@@ -14,7 +14,7 @@ from telegram.error import NetworkError, TimedOut
 
 from src.config import CategoryFolder, Settings
 from src.services.aria2_rpc import Aria2RPCService, Aria2Task
-from src.services.av_search import AVSearchService
+from src.services.av_search import AVSearchService, SearchResult
 from src.services.open115 import AuthSession, Open115APIError, Open115Client, RemoteFile
 from src.services.telegram_user import TelegramUserService
 
@@ -30,7 +30,7 @@ class PendingSelection:
     user_id: int
     kind: str
     payload: dict[str, Any]
-    option_map: dict[str, str] = field(default_factory=dict)
+    option_map: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -59,6 +59,7 @@ class TaskFlowService:
         self.bot: Bot | None = None
         self.pending: dict[str, PendingSelection] = {}
         self.last_save_path: dict[int, str] = {}
+        self.awaiting_av_input: dict[int, int] = {}
         self.active_tasks: dict[str, asyncio.Task] = {}
 
     def bind_bot(self, bot: Bot) -> None:
@@ -88,6 +89,19 @@ class TaskFlowService:
         stale_ids = [selection_id for selection_id, item in self.pending.items() if item.chat_id == chat_id]
         for selection_id in stale_ids:
             self.pending.pop(selection_id, None)
+        self.awaiting_av_input.pop(chat_id, None)
+
+    def begin_av_input(self, *, chat_id: int, user_id: int) -> None:
+        self.awaiting_av_input[chat_id] = user_id
+
+    def is_waiting_for_av_input(self, *, chat_id: int, user_id: int) -> bool:
+        return self.awaiting_av_input.get(chat_id) == user_id
+
+    def consume_av_input(self, *, chat_id: int, user_id: int) -> bool:
+        if not self.is_waiting_for_av_input(chat_id=chat_id, user_id=user_id):
+            return False
+        self.awaiting_av_input.pop(chat_id, None)
+        return True
 
     def build_main_keyboard(self, selection: PendingSelection) -> InlineKeyboardMarkup:
         buttons = [
@@ -113,10 +127,37 @@ class TaskFlowService:
         buttons.append([InlineKeyboardButton("取消", callback_data=f"selc:{selection.selection_id}")])
         return InlineKeyboardMarkup(buttons)
 
+    def build_av_result_keyboard(
+        self,
+        selection: PendingSelection,
+        results: list[SearchResult],
+    ) -> InlineKeyboardMarkup:
+        selection.option_map.clear()
+        buttons = []
+        for index, result in enumerate(results[:10]):
+            option_id = f"r{index}"
+            selection.option_map[option_id] = result
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        _format_av_button_text(result),
+                        callback_data=f"avr:{selection.selection_id}:{option_id}",
+                    )
+                ]
+            )
+        buttons.append([InlineKeyboardButton("取消", callback_data=f"selc:{selection.selection_id}")])
+        return InlineKeyboardMarkup(buttons)
+
     def resolve_save_path(self, selection: PendingSelection, option_id: str) -> str:
         if option_id not in selection.option_map:
             raise KeyError(option_id)
-        return selection.option_map[option_id]
+        return str(selection.option_map[option_id])
+
+    def resolve_av_result(self, selection: PendingSelection, option_id: str) -> SearchResult:
+        result = selection.option_map.get(option_id)
+        if not isinstance(result, SearchResult):
+            raise KeyError(option_id)
+        return result
 
     async def run_auth(self, chat_id: int, auth_session: AuthSession) -> None:
         try:
@@ -136,37 +177,13 @@ class TaskFlowService:
         task = asyncio.create_task(self._offline_to_telegram(task_id, chat_id, user_id, magnet, save_path, label))
         self._track_task(task_id, task)
 
-    async def start_av_task(self, *, chat_id: int, user_id: int, query: str, save_path: str) -> None:
-        task_id = uuid.uuid4().hex[:10]
-        task = asyncio.create_task(self._av_to_telegram(task_id, chat_id, user_id, query, save_path))
-        self._track_task(task_id, task)
-
     async def start_upload_task(self, *, ref: MessageRef, save_path: str) -> None:
         task_id = uuid.uuid4().hex[:10]
         task = asyncio.create_task(self._telegram_file_to_115(task_id, ref, save_path))
         self._track_task(task_id, task)
 
-    async def _av_to_telegram(self, task_id: str, chat_id: int, user_id: int, query: str, save_path: str) -> None:
-        await self.notify(chat_id, f"正在搜索 {query} 的磁力链接。")
-        try:
-            results = await asyncio.to_thread(self.av_search.search, query)
-        except Exception as exc:
-            await self.notify(chat_id, f"/av 搜索失败: {exc}")
-            return
-        if not results:
-            await self.notify(chat_id, f"没有找到 {query} 的可用磁力。")
-            return
-
-        last_error: Exception | None = None
-        for result in results:
-            try:
-                await self._offline_to_telegram(task_id, chat_id, user_id, result.magnet, save_path, query, quiet_start=True)
-                return
-            except Exception as exc:
-                last_error = exc
-                logger.warning("AV candidate failed for %s: %s", query, exc)
-
-        await self.notify(chat_id, f"{query} 的所有候选磁力均失败: {last_error}")
+    async def search_av_results(self, query: str, limit: int = 10) -> list[SearchResult]:
+        return await asyncio.to_thread(self.av_search.search, query, limit)
 
     async def _offline_to_telegram(
         self,
@@ -312,6 +329,21 @@ class TaskFlowService:
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "download"
+
+
+def _format_av_button_text(result: SearchResult) -> str:
+    title = _truncate_text(result.title, 18)
+    hotness = result.hotness or "-"
+    size = result.size or "-"
+    created_at = (result.created_at or "-")[:16]
+    return f"{title} | 热{hotness} | {size} | {created_at}"
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(limit - 3, 1)].rstrip()}..."
 
 
 def _describe_failure_reason(save_path: str, exc: Exception) -> str:

@@ -5,7 +5,7 @@
 - 发送磁力链接到 Telegram，选择目录后离线下载到 115
 - 115 离线完成后自动推送到 aria2
 - aria2 下载完成后通过 Telethon 发回 Telegram
-- `/av 番号` 自动搜索 `sukebei.nyaa.si` 磁力并下载
+- `/av` 后再发送番号，从新站点搜索前 10 条资源并选择下载
 - 发送 `video/document` 到 bot，选择目录后上传到 115
 
 ## 目录
@@ -33,7 +33,7 @@
 
 - `/start`
 - `/auth`
-- `/av <番号>`
+- `/av`
 - `/q`
 
 直接发送 `magnet:` 链接会进入离线下载流程。
@@ -69,3 +69,11 @@ docker compose up -d --build
 - 默认代理写成 `http://127.0.0.1:7890`，适配你服务器上的 mihomo。
 - 如果 bot 是私聊使用，Telethon 回传的文件会发送到当前账号的 `Saved Messages`。
 - 本项目不做任务持久化，重启后不会恢复旧任务。
+
+## AV 搜索脚本
+
+可以单独抓取番号搜索结果和对应磁力链接：
+
+```bash
+python scripts/fetch_av_search_results.py MIMK-145
+```

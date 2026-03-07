@@ -6,3 +6,4 @@ tmp/
 config/config.yaml
 config/115_tokens.json
 config/user_session.session
+config/*.session-journal
