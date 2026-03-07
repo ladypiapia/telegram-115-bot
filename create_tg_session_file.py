@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
+# -*- coding: utf-8 -*-
 import os
 import asyncio
 import warnings
@@ -14,11 +13,16 @@ from telethon.errors import SessionPasswordNeededError
 """
 独立的Telegram Session文件创建脚本
 使用方法：
-1. 通过环境变量提供 TG_API_ID 和 TG_API_HASH
+1. 修改下面的 API_ID 和 API_HASH
 2. 运行脚本：python create_tg_session_file.py
 3. 按照提示输入手机号和验证码
 4. 将生成的 user_session.session 文件放到 config 目录
 """
+
+# 请在这里填入你的API配置
+# 获取地址：https://my.telegram.org/auth
+API_ID = 'xxxxxx'  # 替换为你的API ID
+API_HASH = 'xxxxxx'  # 替换为你的API Hash
 
 # 代理设置 (如果不需要代理，请保持为 None)
 PROXY = None
@@ -35,26 +39,11 @@ PROXY = None
 # }
 
 
-def _load_api_credentials() -> tuple[int, str]:
-    api_id = os.getenv("TG_API_ID", "").strip()
-    api_hash = os.getenv("TG_API_HASH", "").strip()
-    if not api_id or not api_hash:
-        raise RuntimeError(
-            "缺少 TG_API_ID / TG_API_HASH 环境变量。"
-            "请先在 shell 中导出后再运行此脚本。"
-        )
-    try:
-        return int(api_id), api_hash
-    except ValueError as exc:
-        raise RuntimeError("TG_API_ID 必须是整数。") from exc
-
-
 async def create_telegram_session():
-    api_id, api_hash = _load_api_credentials()
     client_params = {
         'session': 'user_session',
-        'api_id': api_id,
-        'api_hash': api_hash
+        'api_id': API_ID,
+        'api_hash': API_HASH
     }
 
     if PROXY:
@@ -129,8 +118,7 @@ async def create_telegram_session():
 async def test_session():
     """测试session文件是否有效"""
     if os.path.exists('user_session.session'):
-        api_id, api_hash = _load_api_credentials()
-        client = TelegramClient('user_session', api_id, api_hash)
+        client = TelegramClient('user_session', API_ID, API_HASH)
         await client.start()
         me = await client.get_me()
         print(f"Session测试成功！当前用户: {me.first_name}")
