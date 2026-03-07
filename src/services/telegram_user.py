@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import socks
 from telethon import TelegramClient
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 
 from src.config import Settings
 
@@ -39,7 +40,14 @@ class TelegramUserService:
         )
 
     async def start(self) -> None:
-        await self.client.connect()
+        try:
+            await self.client.connect()
+        except AuthKeyDuplicatedError as exc:
+            raise RuntimeError(
+                "Telethon 会话已失效：同一个 user_session.session 曾在不同出口 IP 上同时使用，"
+                "Telegram 已废弃这份授权。请停止其他仍在使用该 session 的程序，删除当前 "
+                f"session 文件后重新登录生成新会话：{self.settings.session_file}"
+            ) from exc
 
     async def stop(self) -> None:
         await self.client.disconnect()

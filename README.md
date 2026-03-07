@@ -49,6 +49,18 @@
 5. 启动：
 
 ```bash
+python -m src.main
+```
+
+如需使用其他配置文件，再临时指定：
+
+```bash
+BOT_CONFIG=/path/to/other-config.yaml python -m src.main
+```
+
+或者使用 Docker：
+
+```bash
 docker compose up -d --build
 ```
 

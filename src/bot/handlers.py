@@ -4,7 +4,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from telegram import BotCommand, Message, Update
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, Message, Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
@@ -49,13 +49,25 @@ def register_handlers(application: Application, settings: Settings, flow: TaskFl
 
 
 async def post_init(application: Application) -> None:
-    commands = [
+    settings = application.bot_data.get("settings")
+    chat_id = int(settings.allowed_user) if settings and str(settings.allowed_user).isdigit() else None
+    await register_bot_commands(application, chat_id=chat_id)
+
+
+def build_bot_commands() -> list[BotCommand]:
+    return [
         BotCommand("start", "查看帮助"),
         BotCommand("auth", "115 授权"),
         BotCommand("av", "番号搜索并下载"),
         BotCommand("q", "取消当前选择"),
     ]
-    await application.bot.set_my_commands(commands)
+
+
+async def register_bot_commands(application: Application, chat_id: int | None = None) -> None:
+    commands = build_bot_commands()
+    await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    if chat_id is not None:
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=chat_id))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
