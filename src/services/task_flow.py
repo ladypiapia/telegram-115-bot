@@ -14,7 +14,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from src.config import CategoryFolder, Settings
 from src.services.aria2_rpc import Aria2RPCService, Aria2Task
 from src.services.av_search import AVSearchService
-from src.services.open115 import AuthSession, Open115Client, RemoteFile
+from src.services.open115 import AuthSession, Open115APIError, Open115Client, RemoteFile
 from src.services.telegram_user import TelegramUserService
 
 
@@ -219,11 +219,11 @@ class TaskFlowService:
                 chat_id,
                 f"115 离线完成：{root_name}\n已推送 {len(pushed)} 个文件到 aria2。",
             )
-        except Exception:
+        except Exception as exc:
             if quiet_start:
                 raise
             logger.exception("offline pipeline failed")
-            await self.notify(chat_id, f"任务失败：{label}")
+            await self.notify(chat_id, f"任务失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
             raise
 
     async def _wait_aria2_and_send(
@@ -305,6 +305,14 @@ class TaskFlowService:
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "download"
+
+
+def _describe_failure_reason(save_path: str, exc: Exception) -> str:
+    if isinstance(exc, Open115APIError):
+        if exc.code == 10008:
+            return f"115 提示该离线任务已存在，请勿重复提交。原始消息：{exc.api_message}。保存目录：{save_path}"
+        return f"115 接口异常：{exc.api_message}"
+    return str(exc) or exc.__class__.__name__
 
 
 def _cleanup_empty_dirs(start_dir: Path, stop_dir: Path) -> None:

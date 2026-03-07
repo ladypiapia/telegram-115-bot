@@ -49,6 +49,19 @@ class RemoteFile:
     relative_path: str
 
 
+class Open115APIError(RuntimeError):
+    def __init__(self, action: str, payload: dict[str, Any]) -> None:
+        self.action = action
+        self.payload = payload
+        self.code = payload.get("code")
+        self.api_message = str(payload.get("message") or payload.get("error") or "未知错误")
+        detail = f"115 {action} failed"
+        if self.code is not None:
+            detail += f" (code={self.code})"
+        detail += f": {self.api_message}"
+        super().__init__(detail)
+
+
 class Open115Client:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -288,7 +301,7 @@ class Open115Client:
             data={"urls": magnet, "wp_path_id": folder_info["file_id"]},
         )
         if payload.get("state") is not True:
-            raise RuntimeError(f"115 add offline task failed: {payload}")
+            raise Open115APIError("add offline task", payload)
 
     def list_offline_tasks(self, max_pages: int | None = None) -> list[OfflineTaskInfo]:
         first_page = self._request("GET", f"{self.base_url}/open/offline/get_task_list")
