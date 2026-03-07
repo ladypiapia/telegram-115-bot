@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, TimedOut
 
 from src.config import CategoryFolder, Settings
 from src.services.aria2_rpc import Aria2RPCService, Aria2Task
@@ -38,6 +39,7 @@ class MessageRef:
     user_id: int
     message_id: int
     file_name: str
+    file_id: str
 
 
 class TaskFlowService:
@@ -258,12 +260,10 @@ class TaskFlowService:
         temp_path = Path(self.settings.upload.temp_dir) / temp_name
         await self.notify(ref.chat_id, f"正在下载 Telegram 文件 {ref.file_name}。")
         try:
-            downloaded_file = await self.telegram_user.download_bot_media(
-                ref.chat_id,
-                ref.user_id,
-                ref.message_id,
-                temp_path,
-            )
+            if not self.bot:
+                raise RuntimeError("bot is not bound")
+            tg_file = await self.bot.get_file(ref.file_id)
+            downloaded_file = await tg_file.download_to_drive(custom_path=temp_path)
             await self.notify(ref.chat_id, f"正在上传 {downloaded_file.name} 到 115。")
             uploaded, instant = await asyncio.to_thread(self.open115.upload_file, downloaded_file, save_path)
             if not uploaded:
@@ -279,7 +279,14 @@ class TaskFlowService:
     async def notify(self, chat_id: int, text: str) -> None:
         if not self.bot:
             raise RuntimeError("bot is not bound")
-        await self.bot.send_message(chat_id=chat_id, text=text)
+        for attempt in range(3):
+            try:
+                await self.bot.send_message(chat_id=chat_id, text=text)
+                return
+            except (TimedOut, NetworkError):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1 + attempt)
 
     def _find_category(self, category_name: str) -> CategoryFolder | None:
         for category in self.settings.category_folder:

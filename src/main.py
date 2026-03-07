@@ -44,7 +44,23 @@ async def main() -> None:
     av_search = AVSearchService()
     flow = TaskFlowService(settings, open115, aria2, telegram_user, av_search)
 
-    application = Application.builder().token(settings.bot_token).post_init(post_init).build()
+    builder = (
+        Application.builder()
+        .token(settings.bot_token)
+        .post_init(post_init)
+        .connect_timeout(20)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(20)
+        .get_updates_connect_timeout(20)
+        .get_updates_read_timeout(60)
+        .get_updates_write_timeout(60)
+        .get_updates_pool_timeout(20)
+    )
+    bot_proxy = settings.proxy.https or settings.proxy.http
+    if bot_proxy:
+        builder = builder.proxy(bot_proxy).get_updates_proxy(bot_proxy)
+    application = builder.build()
     flow.bind_bot(application.bot)
     register_handlers(application, settings, flow, open115)
 
