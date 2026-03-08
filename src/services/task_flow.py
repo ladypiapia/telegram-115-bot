@@ -200,10 +200,21 @@ class TaskFlowService:
             raise RuntimeError("aria2 未启用，无法完成自动推送链路")
 
         if not quiet_start:
-            await self.notify(chat_id, f"已接收任务：{label}\n正在提交到 115 离线。")
+            await self.notify(chat_id, f"正在提交到 115 离线：{label}")
 
         try:
             await asyncio.to_thread(self.open115.add_offline_task, magnet, save_path)
+        except Exception as exc:
+            if quiet_start:
+                raise
+            logger.exception("offline submit failed")
+            await self.notify(chat_id, f"提交到 115 失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
+            return
+
+        if not quiet_start:
+            await self.notify(chat_id, f"已提交到 115：{label}\n保存目录：{save_path}")
+
+        try:
             task_info = await asyncio.to_thread(
                 self.open115.wait_offline_complete,
                 magnet,
@@ -211,7 +222,17 @@ class TaskFlowService:
                 self.settings.offline.poll_interval,
                 save_path,
             )
-            root_name = task_info.name or "offline-task"
+        except Exception as exc:
+            if quiet_start:
+                raise
+            logger.exception("wait offline complete failed")
+            await self.notify(chat_id, f"等待 115 离线完成失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
+            return
+
+        root_name = task_info.name or "offline-task"
+        await self.notify(chat_id, f"115 离线已完成：{root_name}")
+
+        try:
             if task_info.file_id:
                 files = await asyncio.to_thread(
                     self.open115.list_downloadable_files_by_id,
@@ -223,11 +244,26 @@ class TaskFlowService:
                 files = await asyncio.to_thread(self.open115.list_downloadable_files, resource_path)
             if not files:
                 raise RuntimeError("115 离线完成后没有发现可下载文件")
+        except Exception as exc:
+            if quiet_start:
+                raise
+            logger.exception("list downloadable files failed")
+            await self.notify(chat_id, f"115 已完成，但读取文件列表失败：{root_name}\n原因：{exc}")
+            return
 
-            pushed: list[Aria2Task] = []
-            root_dir = Path(self.settings.aria2.download_path) / _safe_name(root_name)
-            for remote_file in files:
+        await self.notify(chat_id, f"正在推送到 aria2：{root_name}")
+
+        pushed: list[Aria2Task] = []
+        root_dir = Path(self.settings.aria2.download_path) / _safe_name(root_name)
+        for remote_file in files:
+            try:
                 download_url = await asyncio.to_thread(self.open115.get_download_url, remote_file.pick_code)
+            except Exception as exc:
+                logger.exception("get download url failed")
+                await self.notify(chat_id, f"115 已完成，但获取下载直链失败：{remote_file.name}\n原因：{exc}")
+                continue
+
+            try:
                 relative_parent = Path(remote_file.relative_path).parent
                 local_dir = root_dir if str(relative_parent) == "." else root_dir / relative_parent
                 aria2_task = await asyncio.to_thread(
@@ -236,22 +272,24 @@ class TaskFlowService:
                     local_dir,
                     remote_file.name,
                 )
-                pushed.append(aria2_task)
-                child_task = asyncio.create_task(
-                    self._wait_aria2_and_send(chat_id, user_id, aria2_task, root_dir)
-                )
-                self._track_task(f"{task_id}-{aria2_task.gid}", child_task)
+            except Exception as exc:
+                logger.exception("push to aria2 failed")
+                await self.notify(chat_id, f"115 已完成，但推送 aria2 失败：{remote_file.name}\n原因：{exc}")
+                continue
 
-            await self.notify(
-                chat_id,
-                f"115 离线完成：{root_name}\n已推送 {len(pushed)} 个文件到 aria2。",
+            pushed.append(aria2_task)
+            child_task = asyncio.create_task(
+                self._wait_aria2_and_send(chat_id, user_id, aria2_task, root_dir)
             )
-        except Exception as exc:
-            if quiet_start:
-                raise
-            logger.exception("offline pipeline failed")
-            await self.notify(chat_id, f"任务失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
-            raise
+            self._track_task(f"{task_id}-{aria2_task.gid}", child_task)
+
+        if pushed:
+            await self.notify(chat_id, f"已推送 {len(pushed)} 个文件到 aria2：{root_name}")
+            return
+
+        if quiet_start:
+            raise RuntimeError("No files were pushed to aria2")
+        await self.notify(chat_id, f"115 已完成，但没有文件成功推送到 aria2：{root_name}")
 
     async def _wait_aria2_and_send(
         self,
@@ -272,13 +310,18 @@ class TaskFlowService:
             if not aria2_task.local_path.exists():
                 raise FileNotFoundError(f"aria2 下载完成，但找不到文件: {aria2_task.local_path}")
 
+            await self.notify(chat_id, f"文件已下载，正在发送到 Telegram：{aria2_task.file_name}")
             target_label = await self.telegram_user.send_file(chat_id, user_id, aria2_task.local_path)
             aria2_task.local_path.unlink(missing_ok=True)
             _cleanup_empty_dirs(aria2_task.local_path.parent, root_dir)
             await self.notify(chat_id, f"已发送文件 {aria2_task.file_name} 到 {target_label}。")
         except Exception as exc:
             logger.exception("aria2 send pipeline failed")
-            await self.notify(chat_id, f"文件回传失败 {aria2_task.file_name}: {exc}")
+            message = str(exc) or exc.__class__.__name__
+            if "aria2" in message or "下载" in message or isinstance(exc, FileNotFoundError):
+                await self.notify(chat_id, f"115 已完成，但推送 aria2 失败：{aria2_task.file_name}\n原因：{message}")
+            else:
+                await self.notify(chat_id, f"文件已下载，但发送回 Telegram 失败：{aria2_task.file_name}\n原因：{message}")
 
     async def _telegram_file_to_115(self, task_id: str, ref: MessageRef, save_path: str) -> None:
         temp_name = f"{uuid.uuid4().hex[:8]}-{ref.file_name}"

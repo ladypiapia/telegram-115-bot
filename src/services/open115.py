@@ -435,19 +435,38 @@ class Open115Client:
             files.append(RemoteFile(name=name, pick_code=pick_code, relative_path=relative_path))
         return files
 
-    def get_download_url(self, pick_code: str) -> str:
-        payload = self._request(
-            "POST",
-            f"{self.base_url}/open/ufile/downurl",
-            data={"pick_code": pick_code},
-        )
-        if payload.get("state") is not True:
-            raise RuntimeError(f"115 get download url failed: {payload}")
-        data = payload.get("data") or {}
-        first_value = next(iter(data.values()), None)
-        if not first_value:
-            raise RuntimeError("115 download url response is empty")
-        return first_value["url"]["url"]
+    def get_download_url(self, pick_code: str, retries: int = 6, interval: int = 5) -> str:
+        last_error: Exception | None = None
+        for attempt in range(retries):
+            try:
+                payload = self._request(
+                    "POST",
+                    f"{self.base_url}/open/ufile/downurl",
+                    data={"pick_code": pick_code},
+                )
+                if payload.get("state") is not True:
+                    raise RuntimeError(f"115 get download url failed: {payload}")
+                data = payload.get("data") or {}
+                first_value = next(iter(data.values()), None)
+                if not first_value:
+                    raise RuntimeError("115 download url response is empty")
+                return first_value["url"]["url"]
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = getattr(exc.response, "status_code", None)
+                if status_code == 405 and attempt < retries - 1:
+                    time.sleep(interval)
+                    continue
+                raise
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt < retries - 1:
+                    time.sleep(interval)
+                    continue
+                raise
+        if last_error:
+            raise last_error
+        raise RuntimeError("115 get download url failed")
 
     def upload_file(self, file_path: str | Path, target_path: str) -> tuple[bool, bool]:
         local_path = Path(file_path)
