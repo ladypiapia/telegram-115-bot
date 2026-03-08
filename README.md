@@ -64,6 +64,51 @@ BOT_CONFIG=/path/to/other-config.yaml python -m src.main
 docker compose up -d --build
 ```
 
+## 后台运行与异常通知
+
+不建议直接开一个终端执行 `python -m src.main`。生产环境应使用 `systemd` 托管：
+
+- 后台常驻
+- 开机自启
+- 异常退出自动重启
+- 异常退出时通过 Telegram 推送告警
+
+仓库已提供示例文件：
+
+- `deploy/systemd/telegram-115-bot.service.example`
+- `scripts/send_service_alert.py`
+
+推荐步骤：
+
+1. 先确认项目虚拟环境和 `config/config.yaml` 都已就绪。
+2. 将示例 service 复制到系统目录：
+
+```bash
+cp deploy/systemd/telegram-115-bot.service.example /etc/systemd/system/telegram-115-bot.service
+```
+
+3. 按你的实际路径修改 `WorkingDirectory`、`BOT_CONFIG`、`ExecStart`、`ExecStopPost`。
+4. 重新加载并启动：
+
+```bash
+systemctl daemon-reload
+systemctl enable --now telegram-115-bot
+```
+
+5. 查看状态和日志：
+
+```bash
+systemctl status telegram-115-bot
+journalctl -u telegram-115-bot -f
+```
+
+说明：
+
+- `Restart=always` 会在进程退出后自动拉起。
+- `ExecStopPost` 会在服务停止后触发告警脚本。
+- 告警脚本会读取 `BOT_CONFIG`，使用当前 bot token 和 `allowed_user` 给你发消息。
+- 告警脚本默认只在非正常停止时发送通知；手动正常停服不会骚扰你。
+
 ## 说明
 
 - 默认代理写成 `http://127.0.0.1:7890`，适配你服务器上的 mihomo。
