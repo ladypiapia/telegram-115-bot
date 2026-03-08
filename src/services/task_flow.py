@@ -212,8 +212,15 @@ class TaskFlowService:
                 save_path,
             )
             root_name = task_info.name or "offline-task"
-            resource_path = f"{save_path.rstrip('/')}/{root_name}"
-            files = await asyncio.to_thread(self.open115.list_downloadable_files, resource_path)
+            if task_info.file_id:
+                files = await asyncio.to_thread(
+                    self.open115.list_downloadable_files_by_id,
+                    task_info.file_id,
+                    root_name,
+                )
+            else:
+                resource_path = f"{save_path.rstrip('/')}/{root_name}"
+                files = await asyncio.to_thread(self.open115.list_downloadable_files, resource_path)
             if not files:
                 raise RuntimeError("115 离线完成后没有发现可下载文件")
 

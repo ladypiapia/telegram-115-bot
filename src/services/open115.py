@@ -396,11 +396,25 @@ class Open115Client:
         info = self.get_file_info(root_path)
         if not info:
             raise RuntimeError(f"115 file path not found: {root_path}")
+        return self._list_downloadable_files_from_info(info, fallback_name=Path(root_path).name)
+
+    def list_downloadable_files_by_id(self, file_id: str, fallback_name: str = "") -> list[RemoteFile]:
+        info = self.get_file_info_by_id(file_id)
+        if not info:
+            raise RuntimeError(f"115 file id not found: {file_id}")
+        return self._list_downloadable_files_from_info(info, fallback_name=fallback_name)
+
+    def _list_downloadable_files_from_info(
+        self,
+        info: dict[str, Any],
+        *,
+        fallback_name: str,
+    ) -> list[RemoteFile]:
         if str(info.get("file_category")) != "0":
-            file_name = str(info.get("file_name") or Path(root_path).name)
+            file_name = str(info.get("file_name") or fallback_name or "offline-file")
             pick_code = str(info.get("pick_code") or info.get("pc") or "")
             if not pick_code:
-                raise RuntimeError(f"115 pick_code missing for file: {root_path}")
+                raise RuntimeError(f"115 pick_code missing for file id: {info.get('file_id') or info.get('cid')}")
             return [RemoteFile(name=file_name, pick_code=pick_code, relative_path=file_name)]
         return self._walk_files(str(info["file_id"]), "")
 
