@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -352,15 +353,29 @@ class Open115Client:
                 )
         return tasks
 
-    def wait_offline_complete(self, magnet: str, timeout: int, interval: int) -> OfflineTaskInfo:
+    def wait_offline_complete(
+        self,
+        magnet: str,
+        timeout: int,
+        interval: int,
+        save_path: str | None = None,
+    ) -> OfflineTaskInfo:
         deadline = time.time() + timeout
+        last_seen_task: OfflineTaskInfo | None = None
         while time.time() < deadline:
-            for task in self.list_offline_tasks(max_pages=3):
-                if task.url != magnet:
+            for task in self.list_offline_tasks():
+                if not _offline_task_matches(task, magnet):
                     continue
+                last_seen_task = task
                 if task.status == 2 or task.percent_done >= 100:
                     return task
+                if save_path and task.name and self.get_file_info(f"{save_path.rstrip('/')}/{task.name}"):
+                    return task
             time.sleep(interval)
+        if save_path and last_seen_task and last_seen_task.name:
+            resource_path = f"{save_path.rstrip('/')}/{last_seen_task.name}"
+            if self.get_file_info(resource_path):
+                return last_seen_task
         raise TimeoutError("115 offline task timed out")
 
     def get_file_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -566,3 +581,38 @@ def _file_sha1_by_range(path: Path, start: int, end: int) -> str:
         handle.seek(start)
         sha1.update(handle.read(size))
     return sha1.hexdigest()
+
+
+def _offline_task_matches(task: OfflineTaskInfo, magnet: str) -> bool:
+    if task.url == magnet:
+        return True
+    task_hash = _extract_btih(task.url) or task.info_hash
+    magnet_hash = _extract_btih(magnet)
+    if task_hash and magnet_hash and task_hash.lower() == magnet_hash.lower():
+        return True
+    return _normalize_magnet(task.url) == _normalize_magnet(magnet)
+
+
+def _extract_btih(magnet: str) -> str:
+    match = re.search(r"btih:([A-Fa-f0-9]+)", magnet)
+    if match:
+        return match.group(1)
+    parsed = urlparse(magnet)
+    xt_values = parse_qs(parsed.query).get("xt", [])
+    for value in xt_values:
+        xt_match = re.search(r"btih:([A-Fa-f0-9]+)", value)
+        if xt_match:
+            return xt_match.group(1)
+    return ""
+
+
+def _normalize_magnet(magnet: str) -> str:
+    parsed = urlparse(magnet)
+    if parsed.scheme != "magnet":
+        return magnet.strip()
+    query = parse_qs(parsed.query)
+    normalized_parts: list[tuple[str, str]] = []
+    for key in sorted(query.keys()):
+        values = sorted(value.strip() for value in query[key] if value.strip())
+        normalized_parts.extend((key, value) for value in values)
+    return "&".join(f"{key}={value}" for key, value in normalized_parts)

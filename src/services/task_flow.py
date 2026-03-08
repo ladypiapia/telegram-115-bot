@@ -209,6 +209,7 @@ class TaskFlowService:
                 magnet,
                 self.settings.offline.timeout,
                 self.settings.offline.poll_interval,
+                save_path,
             )
             root_name = task_info.name or "offline-task"
             resource_path = f"{save_path.rstrip('/')}/{root_name}"
