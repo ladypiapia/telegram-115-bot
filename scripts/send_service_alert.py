@@ -76,18 +76,21 @@ def main() -> int:
     if not should_notify(args.force):
         return 0
 
-    settings = load_settings(args.config)
-    settings.apply_proxy_env()
+    try:
+        settings = load_settings(args.config)
+        settings.apply_proxy_env()
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{settings.bot_token}/sendMessage",
-        data={
-            "chat_id": settings.allowed_user,
-            "text": build_message(args.service, args.event),
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
+        response = requests.post(
+            f"https://api.telegram.org/bot{settings.bot_token}/sendMessage",
+            data={
+                "chat_id": settings.allowed_user,
+                "text": build_message(args.service, args.event),
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"send_service_alert failed: {exc}", file=sys.stderr)
     return 0
 
 
