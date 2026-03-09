@@ -63,6 +63,14 @@ class Open115APIError(RuntimeError):
         super().__init__(detail)
 
 
+class Open115TemporaryError(RuntimeError):
+    def __init__(self, action: str, detail: str, *, status_code: int | None = None, payload: dict[str, Any] | None = None) -> None:
+        self.action = action
+        self.status_code = status_code
+        self.payload = payload or {}
+        super().__init__(f"115 temporary failure during {action}: {detail}")
+
+
 class Open115Client:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -110,30 +118,73 @@ class Open115Client:
         headers: dict[str, str] | None = None,
         require_auth: bool = True,
         allow_refresh: bool = True,
+        retries: int = 1,
+        retry_interval: int = 3,
+        action: str = "request",
     ) -> dict[str, Any]:
         req_headers = headers or (self._auth_headers() if require_auth else {"User-Agent": USER_AGENT})
-        response = self.session.request(
-            method=method,
-            url=url,
-            params=params,
-            data=data,
-            headers=req_headers,
-            timeout=(10, 60),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if require_auth and allow_refresh and payload.get("code") == 40140125:
-            self.refresh_access_token()
-            return self._request(
-                method,
-                url,
-                params=params,
-                data=data,
-                headers=headers,
-                require_auth=require_auth,
-                allow_refresh=False,
-            )
-        return payload
+        last_error: Exception | None = None
+        attempts = max(retries, 1)
+        for attempt in range(attempts):
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    data=data,
+                    headers=req_headers,
+                    timeout=(10, 60),
+                )
+                response.raise_for_status()
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_error = exc
+                if attempt < attempts - 1:
+                    time.sleep(retry_interval * (attempt + 1))
+                    continue
+                raise Open115TemporaryError(action, str(exc)) from exc
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = getattr(exc.response, "status_code", None)
+                if _is_retryable_status_code(status_code):
+                    if attempt < attempts - 1:
+                        time.sleep(retry_interval * (attempt + 1))
+                        continue
+                    raise Open115TemporaryError(
+                        action,
+                        f"HTTP {status_code} for {url}",
+                        status_code=status_code,
+                    ) from exc
+                raise
+
+            payload = response.json()
+            if require_auth and allow_refresh and payload.get("code") == 40140125:
+                self.refresh_access_token()
+                return self._request(
+                    method,
+                    url,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                    require_auth=require_auth,
+                    allow_refresh=False,
+                    retries=retries,
+                    retry_interval=retry_interval,
+                    action=action,
+                )
+            if _is_retryable_payload(payload):
+                last_error = Open115TemporaryError(
+                    action,
+                    str(payload.get("message") or payload.get("error") or payload),
+                    payload=payload,
+                )
+                if attempt < attempts - 1:
+                    time.sleep(retry_interval * (attempt + 1))
+                    continue
+                raise last_error
+            return payload
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"115 {action} failed without details")
 
     def refresh_access_token(self) -> None:
         self._load_tokens_from_disk()
@@ -148,6 +199,9 @@ class Open115Client:
                 "User-Agent": USER_AGENT,
             },
             require_auth=False,
+            retries=3,
+            retry_interval=5,
+            action="refresh access token",
         )
         data = payload.get("data") or {}
         if not payload.get("state") or not data.get("access_token"):
@@ -173,6 +227,9 @@ class Open115Client:
                 "User-Agent": USER_AGENT,
             },
             require_auth=False,
+            retries=3,
+            retry_interval=3,
+            action="create auth session",
         )
         data = payload.get("data") or {}
         if not payload.get("data"):
@@ -202,6 +259,9 @@ class Open115Client:
                     "sign": auth_session.sign,
                 },
                 require_auth=False,
+                retries=3,
+                retry_interval=3,
+                action="poll auth status",
             )
             if payload.get("state") == 0:
                 raise RuntimeError("115 auth QR code expired")
@@ -220,6 +280,9 @@ class Open115Client:
                         "User-Agent": USER_AGENT,
                     },
                     require_auth=False,
+                    retries=3,
+                    retry_interval=3,
+                    action="exchange auth token",
                 )
                 token_data = token_payload.get("data") or {}
                 if not token_data.get("access_token"):
@@ -232,7 +295,13 @@ class Open115Client:
         raise TimeoutError("115 auth timed out")
 
     def get_user_info(self) -> dict[str, Any]:
-        payload = self._request("GET", f"{self.base_url}/open/user/info")
+        payload = self._request(
+            "GET",
+            f"{self.base_url}/open/user/info",
+            retries=5,
+            retry_interval=5,
+            action="get user info",
+        )
         data = payload.get("data")
         if payload.get("code") != 0 or not data:
             raise RuntimeError(f"115 get_user_info failed: {payload}")
@@ -243,6 +312,9 @@ class Open115Client:
             "GET",
             f"{self.base_url}/open/folder/get_info",
             params={"path": os.path.normpath(path)},
+            retries=3,
+            retry_interval=2,
+            action=f"get file info by path {path}",
         )
         if payload.get("code") == 0:
             return payload.get("data")
@@ -253,6 +325,9 @@ class Open115Client:
             "GET",
             f"{self.base_url}/open/folder/get_info",
             params={"file_id": file_id},
+            retries=3,
+            retry_interval=2,
+            action=f"get file info by id {file_id}",
         )
         if payload.get("code") == 0:
             return payload.get("data")
@@ -263,6 +338,9 @@ class Open115Client:
             "POST",
             f"{self.base_url}/open/folder/add",
             data={"pid": pid, "file_name": name},
+            retries=4,
+            retry_interval=4,
+            action=f"create directory {name}",
         )
         if payload.get("state") is True or payload.get("code") == 0:
             return payload.get("data") or {}
@@ -300,12 +378,21 @@ class Open115Client:
             "POST",
             f"{self.base_url}/open/offline/add_task_urls",
             data={"urls": magnet, "wp_path_id": folder_info["file_id"]},
+            retries=4,
+            retry_interval=4,
+            action="add offline task",
         )
         if payload.get("state") is not True:
             raise Open115APIError("add offline task", payload)
 
     def list_offline_tasks(self, max_pages: int | None = None) -> list[OfflineTaskInfo]:
-        first_page = self._request("GET", f"{self.base_url}/open/offline/get_task_list")
+        first_page = self._request(
+            "GET",
+            f"{self.base_url}/open/offline/get_task_list",
+            retries=3,
+            retry_interval=3,
+            action="get offline task list",
+        )
         if first_page.get("code") != 0:
             raise RuntimeError(f"115 get offline tasks failed: {first_page}")
 
@@ -333,9 +420,12 @@ class Open115Client:
                     "GET",
                     f"{self.base_url}/open/offline/get_task_list",
                     params={"page": page},
+                    retries=3,
+                    retry_interval=3,
+                    action=f"get offline task list page {page}",
                 )
-            except requests.HTTPError as exc:
-                status_code = getattr(exc.response, "status_code", None)
+            except (requests.HTTPError, Open115TemporaryError) as exc:
+                status_code = getattr(exc, "status_code", None)
                 if status_code == 405:
                     break
                 raise
@@ -443,6 +533,9 @@ class Open115Client:
                     "POST",
                     f"{self.base_url}/open/ufile/downurl",
                     data={"pick_code": pick_code},
+                    retries=2,
+                    retry_interval=interval,
+                    action=f"get download url {pick_code}",
                 )
                 if payload.get("state") is not True:
                     raise RuntimeError(f"115 get download url failed: {payload}")
@@ -451,9 +544,9 @@ class Open115Client:
                 if not first_value:
                     raise RuntimeError("115 download url response is empty")
                 return first_value["url"]["url"]
-            except requests.HTTPError as exc:
+            except (requests.HTTPError, Open115TemporaryError) as exc:
                 last_error = exc
-                status_code = getattr(exc.response, "status_code", None)
+                status_code = getattr(exc, "status_code", None)
                 if status_code == 405 and attempt < retries - 1:
                     time.sleep(interval)
                     continue
@@ -537,7 +630,13 @@ class Open115Client:
         return True, False
 
     def get_upload_token(self) -> dict[str, Any]:
-        payload = self._request("GET", f"{self.base_url}/open/upload/get_token")
+        payload = self._request(
+            "GET",
+            f"{self.base_url}/open/upload/get_token",
+            retries=4,
+            retry_interval=4,
+            action="get upload token",
+        )
         if payload.get("code") != 0:
             raise RuntimeError(f"115 get upload token failed: {payload}")
         return payload["data"]
@@ -649,3 +748,15 @@ def _normalize_magnet(magnet: str) -> str:
         values = sorted(value.strip() for value in query[key] if value.strip())
         normalized_parts.extend((key, value) for value in values)
     return "&".join(f"{key}={value}" for key, value in normalized_parts)
+
+
+def _is_retryable_status_code(status_code: int | None) -> bool:
+    return status_code in {405, 408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_payload(payload: dict[str, Any]) -> bool:
+    code = payload.get("code")
+    if code in {770004, 990009}:
+        return True
+    message = str(payload.get("message") or payload.get("error") or "")
+    return "稍后再试" in message or "访问上限" in message

@@ -16,7 +16,7 @@ from src.config import Settings, load_settings
 from src.runtime import RuntimeHealth
 from src.services.aria2_rpc import Aria2RPCService
 from src.services.av_search import AVSearchService
-from src.services.open115 import Open115Client
+from src.services.open115 import Open115Client, Open115TemporaryError
 from src.services.task_flow import TaskFlowService
 from src.services.telegram_user import TelegramUserService
 from src.systemd_notify import SystemdNotifier
@@ -76,8 +76,7 @@ async def main() -> None:
     notifier = SystemdNotifier()
 
     open115 = Open115Client(settings)
-    user_info = open115.get_user_info()
-    runtime_health.mark_progress("115 bootstrap ok")
+    user_info = await _load_startup_user_info(open115, runtime_health)
 
     telegram_user = TelegramUserService(settings)
     await telegram_user.start()
@@ -196,6 +195,9 @@ async def _notify_startup(flow: TaskFlowService, chat_id: int, user_info: dict) 
 
 def _format_startup_message(user_info: dict) -> str:
     lines = ["机器人启动成功。", "115 用户信息："]
+    if user_info.get("_startup_warning"):
+        lines.append(f"状态: {user_info['_startup_warning']}")
+        return "\n".join(lines)
     for label, value in (
         ("用户 ID", _pick_first(user_info, "user_id", "uid")),
         ("昵称", _pick_first(user_info, "user_name", "nick_name", "nickname")),
@@ -356,6 +358,31 @@ async def _startup_probe(
         async with asyncio.timeout(runtime_health.aria2_rpc_timeout):
             await asyncio.to_thread(aria2.get_version, runtime_health.aria2_rpc_timeout)
         runtime_health.mark_progress("aria2 bootstrap ok")
+
+
+async def _load_startup_user_info(
+    open115: Open115Client,
+    runtime_health: RuntimeHealth,
+) -> dict[str, object]:
+    logger = logging.getLogger(__name__)
+    for attempt in range(5):
+        try:
+            user_info = await asyncio.to_thread(open115.get_user_info)
+        except Open115TemporaryError as exc:
+            delay = min(5 * (attempt + 1), 30)
+            logger.warning("115 user info bootstrap failed temporarily (%s/5): %s", attempt + 1, exc)
+            if attempt == 4:
+                break
+            await asyncio.sleep(delay)
+        except Exception as exc:
+            logger.warning("115 user info bootstrap skipped: %s", exc)
+            return {"_startup_warning": f"启动时获取 115 用户信息失败，已降级启动。原因: {exc}"}
+        else:
+            runtime_health.mark_progress("115 bootstrap ok")
+            return user_info
+    warning = "启动时获取 115 用户信息失败，115 接口暂时不可用，已降级启动。"
+    runtime_health.last_error = warning
+    return {"_startup_warning": warning}
 
 
 async def _systemd_watchdog(notifier: SystemdNotifier, runtime_health: RuntimeHealth) -> None:

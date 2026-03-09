@@ -16,7 +16,7 @@ from src.config import CategoryFolder, Settings
 from src.runtime import RuntimeFatalError, RuntimeHealth
 from src.services.aria2_rpc import Aria2RPCService, Aria2Task
 from src.services.av_search import AVSearchService, SearchResult
-from src.services.open115 import AuthSession, Open115APIError, Open115Client, RemoteFile
+from src.services.open115 import AuthSession, Open115APIError, Open115Client, Open115TemporaryError, RemoteFile
 from src.services.telegram_user import TelegramUserService
 
 
@@ -560,6 +560,8 @@ def _truncate_text(text: str, limit: int) -> str:
 
 
 def _describe_failure_reason(save_path: str, exc: Exception) -> str:
+    if isinstance(exc, Open115TemporaryError):
+        return f"115 接口暂时不可用或被限流：{exc}。保存目录：{save_path}"
     if isinstance(exc, Open115APIError):
         if exc.code == 10008:
             return f"115 提示该离线任务已存在，请勿重复提交。原始消息：{exc.api_message}。保存目录：{save_path}"
