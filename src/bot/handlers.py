@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, Message, Update
@@ -16,6 +17,7 @@ from telegram.ext import (
 )
 
 from src.config import Settings
+from src.runtime import RuntimeFatalError, RuntimeHealth
 from src.services.open115 import Open115Client
 from src.services.task_flow import MessageRef, TaskFlowService
 
@@ -31,20 +33,27 @@ HELP_TEXT = """可用命令：
 
 
 logger = logging.getLogger(__name__)
+HandlerFunc = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
 
 
 def register_handlers(application: Application, settings: Settings, flow: TaskFlowService, open115: Open115Client) -> None:
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("auth", auth))
-    application.add_handler(CommandHandler("av", av))
-    application.add_handler(CommandHandler("q", cancel))
-    application.add_handler(CallbackQueryHandler(selection_callback, pattern=r"^(selm|sell|sellast|selc|avr):"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, media_message))
+    application.add_handler(CommandHandler("start", _wrap_handler("start", start)))
+    application.add_handler(CommandHandler("auth", _wrap_handler("auth", auth)))
+    application.add_handler(CommandHandler("av", _wrap_handler("av", av)))
+    application.add_handler(CommandHandler("q", _wrap_handler("cancel", cancel)))
+    application.add_handler(
+        CallbackQueryHandler(
+            _wrap_handler("selection_callback", selection_callback),
+            pattern=r"^(selm|sell|sellast|selc|avr):",
+        )
+    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _wrap_handler("text_message", text_message)))
+    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, _wrap_handler("media_message", media_message)))
 
     application.bot_data["settings"] = settings
     application.bot_data["flow"] = flow
     application.bot_data["open115"] = open115
+    application.bot_data["runtime_health"] = flow.runtime_health
     application.add_error_handler(on_error)
 
 
@@ -85,7 +94,13 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     qr_path = Path(settings.upload.temp_dir) / f"115-auth-{update.effective_chat.id}.png"
     try:
-        auth_session = await asyncio.to_thread(open115.create_auth_session, qr_path)
+        auth_session = await flow.run_blocking_stage(
+            "115 创建授权二维码",
+            open115.create_auth_session,
+            qr_path,
+        )
+    except RuntimeFatalError:
+        raise
     except Exception as exc:
         await _reply_text_with_retry(update.effective_message, f"无法创建 115 授权二维码: {exc}")
         return
@@ -286,6 +301,8 @@ async def _dispatch_selection(query, flow: TaskFlowService, selection, save_path
         await query.edit_message_text(f"正在搜索 {query_text} 的资源...\n保存目录: {save_path}")
         try:
             results = await flow.search_av_results(query_text, limit=10)
+        except RuntimeFatalError:
+            raise
         except Exception as exc:
             await query.edit_message_text(f"/av 搜索失败: {exc}")
             return
@@ -358,3 +375,35 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Unhandled telegram update error",
         exc_info=(type(context.error), context.error, context.error.__traceback__),
     )
+
+
+def _wrap_handler(name: str, handler: HandlerFunc) -> HandlerFunc:
+    async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        runtime_health = _runtime_health(context)
+        runtime_health.mark_update_start(name)
+        try:
+            async with asyncio.timeout(runtime_health.handler_timeout):
+                await handler(update, context)
+        except TimeoutError:
+            runtime_health.last_error = f"handler timed out: {name}"
+            logger.error("Handler %s timed out after %ss", name, runtime_health.handler_timeout)
+            await _notify_handler_timeout(update)
+        finally:
+            runtime_health.mark_update_end()
+
+    return _wrapped
+
+
+def _runtime_health(context: ContextTypes.DEFAULT_TYPE) -> RuntimeHealth:
+    return context.application.bot_data["runtime_health"]
+
+
+async def _notify_handler_timeout(update: Update) -> None:
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("当前操作超时，请重试。", show_alert=True)
+            return
+        if update.effective_message:
+            await _reply_text_with_retry(update.effective_message, "当前操作超时，请重试。")
+    except Exception:
+        logger.exception("Failed to send handler timeout notification")

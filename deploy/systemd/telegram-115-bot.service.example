@@ -4,7 +4,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 WorkingDirectory=/root/projects/telegram-115-bot
 Environment=BOT_CONFIG=/root/projects/telegram-115-bot/config/config.yaml
@@ -13,6 +14,7 @@ ExecStart=/root/projects/telegram-115-bot/.venv/bin/python -m src.main
 ExecStopPost=/root/projects/telegram-115-bot/.venv/bin/python /root/projects/telegram-115-bot/scripts/send_service_alert.py unexpected-exit --service telegram-115-bot
 Restart=always
 RestartSec=5
+WatchdogSec=90
 StartLimitIntervalSec=300
 StartLimitBurst=10
 TimeoutStopSec=30

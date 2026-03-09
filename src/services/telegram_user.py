@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 import socks
@@ -81,12 +82,20 @@ class TelegramUserService:
             raise RuntimeError("Telegram media download failed")
         return Path(saved)
 
-    async def send_file(self, chat_id: int, user_id: int, file_path: str | Path, caption: str | None = None) -> str:
+    async def send_file(
+        self,
+        chat_id: int,
+        user_id: int,
+        file_path: str | Path,
+        caption: str | None = None,
+        progress_callback: Callable[[int, int], object] | None = None,
+    ) -> str:
         entity = self._resolve_send_entity(chat_id, user_id)
         await self.client.send_file(
             entity,
             file=str(file_path),
             caption=caption,
             force_document=True,
+            progress_callback=progress_callback,
         )
         return "Saved Messages" if entity == "me" else str(chat_id)

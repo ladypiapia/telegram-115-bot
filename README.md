@@ -105,13 +105,25 @@ journalctl -u telegram-115-bot -f
 说明：
 
 - `Restart=always` 会在进程退出后自动拉起。
+- 示例 service 已改为 `Type=notify` + `WatchdogSec=90`，进程假活或事件循环卡死时也能被 systemd 兜底重启。
 - `ExecStopPost` 会在服务停止后触发告警脚本。
 - 告警脚本会读取 `BOT_CONFIG`，使用当前 bot token 和 `allowed_user` 给你发消息。
 - 告警脚本默认只在非正常停止时发送通知；手动正常停服不会骚扰你。
 
+可选 watchdog 环境变量：
+
+- `BOT_GET_UPDATES_STUCK_TIMEOUT`，默认 `180`
+- `BOT_HANDLER_TIMEOUT`，默认 `120`
+- `BOT_BLOCKING_STAGE_TIMEOUT`，默认 `300`
+- `BOT_ARIA2_RPC_TIMEOUT`，默认 `15`
+- `BOT_TELEGRAM_TRANSFER_TIMEOUT`，默认 `3600`
+- `BOT_TELETHON_STALL_TIMEOUT`，默认 `300`
+- `BOT_WATCHDOG_INTERVAL`，默认 `15`
+
 ## 说明
 
 - 默认代理写成 `http://127.0.0.1:7890`，适配你服务器上的 mihomo。
+- 如果 mihomo 同时提供 SOCKS5 端口，优先改成 `socks5://127.0.0.1:<port>`。
 - 如果 bot 是私聊使用，Telethon 回传的文件会发送到当前账号的 `Saved Messages`。
 - 本项目不做任务持久化，重启后不会恢复旧任务。
 

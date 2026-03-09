@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import NetworkError, TimedOut
 
 from src.config import CategoryFolder, Settings
+from src.runtime import RuntimeFatalError, RuntimeHealth
 from src.services.aria2_rpc import Aria2RPCService, Aria2Task
 from src.services.av_search import AVSearchService, SearchResult
 from src.services.open115 import AuthSession, Open115APIError, Open115Client, RemoteFile
@@ -21,6 +22,7 @@ from src.services.telegram_user import TelegramUserService
 
 logger = logging.getLogger(__name__)
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:btih:[^ ]+", re.IGNORECASE)
+T = TypeVar("T")
 
 
 @dataclass(slots=True)
@@ -50,12 +52,14 @@ class TaskFlowService:
         aria2: Aria2RPCService,
         telegram_user: TelegramUserService,
         av_search: AVSearchService,
+        runtime_health: RuntimeHealth,
     ) -> None:
         self.settings = settings
         self.open115 = open115
         self.aria2 = aria2
         self.telegram_user = telegram_user
         self.av_search = av_search
+        self.runtime_health = runtime_health
         self.bot: Bot | None = None
         self.pending: dict[str, PendingSelection] = {}
         self.last_save_path: dict[int, str] = {}
@@ -161,8 +165,17 @@ class TaskFlowService:
 
     async def run_auth(self, chat_id: int, auth_session: AuthSession) -> None:
         try:
-            await asyncio.to_thread(self.open115.wait_for_auth, auth_session)
+            await self.run_blocking_stage(
+                "115 授权等待扫码",
+                self.open115.wait_for_auth,
+                auth_session,
+                timeout=max(self.runtime_health.blocking_stage_timeout, 330),
+            )
             await self.notify(chat_id, "115 授权成功。")
+        except RuntimeFatalError as exc:
+            logger.exception("115 auth stalled")
+            await self._notify_fatal_timeout(chat_id, exc)
+            raise
         except Exception as exc:
             logger.exception("115 auth failed")
             await self.notify(chat_id, f"115 授权失败: {exc}")
@@ -183,7 +196,64 @@ class TaskFlowService:
         self._track_task(task_id, task)
 
     async def search_av_results(self, query: str, limit: int = 10) -> list[SearchResult]:
-        return await asyncio.to_thread(self.av_search.search, query, limit)
+        return await self.run_blocking_stage(
+            f"AV 搜索 {query}",
+            self.av_search.search,
+            query,
+            limit,
+            timeout=60,
+        )
+
+    async def run_stage(
+        self,
+        stage_label: str,
+        operation: Awaitable[T],
+        *,
+        stage_key: str | None = None,
+        stall_timeout: float,
+        absolute_timeout: float | None = None,
+        fatal_on_timeout: bool = True,
+    ) -> T:
+        key = stage_key or self._stage_key(stage_label)
+        self.runtime_health.start_stage(key, stage_label, stall_timeout, fatal=fatal_on_timeout)
+        try:
+            if absolute_timeout is None:
+                result = await operation
+            else:
+                async with asyncio.timeout(absolute_timeout):
+                    result = await operation
+        except TimeoutError as exc:
+            reason = f"{stage_label} 超时，已超过 {int(absolute_timeout or stall_timeout)} 秒"
+            if fatal_on_timeout:
+                self.runtime_health.mark_fatal(reason)
+                raise RuntimeFatalError(reason) from exc
+            raise TimeoutError(reason) from exc
+        finally:
+            self.runtime_health.finish_stage(key)
+        self.runtime_health.mark_progress(f"stage ok: {stage_label}")
+        return result
+
+    async def run_blocking_stage(
+        self,
+        stage_label: str,
+        func: Callable[..., T],
+        *args,
+        stage_key: str | None = None,
+        timeout: float | None = None,
+        fatal_on_timeout: bool = True,
+    ) -> T:
+        stage_timeout = float(timeout if timeout is not None else self.runtime_health.blocking_stage_timeout)
+        return await self.run_stage(
+            stage_label,
+            asyncio.to_thread(func, *args),
+            stage_key=stage_key,
+            stall_timeout=stage_timeout,
+            absolute_timeout=stage_timeout,
+            fatal_on_timeout=fatal_on_timeout,
+        )
+
+    def touch_stage(self, stage_key: str) -> None:
+        self.runtime_health.touch_stage(stage_key)
 
     async def _offline_to_telegram(
         self,
@@ -196,100 +266,134 @@ class TaskFlowService:
         *,
         quiet_start: bool = False,
     ) -> None:
-        if not self.aria2.settings.enable:
-            raise RuntimeError("aria2 未启用，无法完成自动推送链路")
-
-        if not quiet_start:
-            await self.notify(chat_id, f"正在提交到 115 离线：{label}")
-
         try:
-            await asyncio.to_thread(self.open115.add_offline_task, magnet, save_path)
-        except Exception as exc:
-            if quiet_start:
-                raise
-            logger.exception("offline submit failed")
-            await self.notify(chat_id, f"提交到 115 失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
-            return
+            if not self.aria2.settings.enable:
+                raise RuntimeError("aria2 未启用，无法完成自动推送链路")
 
-        if not quiet_start:
-            await self.notify(chat_id, f"已提交到 115：{label}\n保存目录：{save_path}")
-
-        try:
-            task_info = await asyncio.to_thread(
-                self.open115.wait_offline_complete,
-                magnet,
-                self.settings.offline.timeout,
-                self.settings.offline.poll_interval,
-                save_path,
-            )
-        except Exception as exc:
-            if quiet_start:
-                raise
-            logger.exception("wait offline complete failed")
-            await self.notify(chat_id, f"等待 115 离线完成失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
-            return
-
-        root_name = task_info.name or "offline-task"
-        await self.notify(chat_id, f"115 离线已完成：{root_name}")
-
-        try:
-            if task_info.file_id:
-                files = await asyncio.to_thread(
-                    self.open115.list_downloadable_files_by_id,
-                    task_info.file_id,
-                    root_name,
-                )
-            else:
-                resource_path = f"{save_path.rstrip('/')}/{root_name}"
-                files = await asyncio.to_thread(self.open115.list_downloadable_files, resource_path)
-            if not files:
-                raise RuntimeError("115 离线完成后没有发现可下载文件")
-        except Exception as exc:
-            if quiet_start:
-                raise
-            logger.exception("list downloadable files failed")
-            await self.notify(chat_id, f"115 已完成，但读取文件列表失败：{root_name}\n原因：{exc}")
-            return
-
-        await self.notify(chat_id, f"正在推送到 aria2：{root_name}")
-
-        pushed: list[Aria2Task] = []
-        root_dir = Path(self.settings.aria2.download_path) / _safe_name(root_name)
-        for remote_file in files:
-            try:
-                download_url = await asyncio.to_thread(self.open115.get_download_url, remote_file.pick_code)
-            except Exception as exc:
-                logger.exception("get download url failed")
-                await self.notify(chat_id, f"115 已完成，但获取下载直链失败：{remote_file.name}\n原因：{exc}")
-                continue
+            if not quiet_start:
+                await self.notify(chat_id, f"正在提交到 115 离线：{label}")
 
             try:
-                relative_parent = Path(remote_file.relative_path).parent
-                local_dir = root_dir if str(relative_parent) == "." else root_dir / relative_parent
-                aria2_task = await asyncio.to_thread(
-                    self.aria2.add_download,
-                    download_url,
-                    local_dir,
-                    remote_file.name,
+                await self.run_blocking_stage(
+                    f"115 提交离线任务 {label}",
+                    self.open115.add_offline_task,
+                    magnet,
+                    save_path,
                 )
+            except RuntimeFatalError:
+                raise
             except Exception as exc:
-                logger.exception("push to aria2 failed")
-                await self.notify(chat_id, f"115 已完成，但推送 aria2 失败：{remote_file.name}\n原因：{exc}")
-                continue
+                if quiet_start:
+                    raise
+                logger.exception("offline submit failed")
+                await self.notify(chat_id, f"提交到 115 失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
+                return
 
-            pushed.append(aria2_task)
-            child_task = asyncio.create_task(
-                self._wait_aria2_and_send(chat_id, user_id, aria2_task, root_dir)
-            )
-            self._track_task(f"{task_id}-{aria2_task.gid}", child_task)
+            if not quiet_start:
+                await self.notify(chat_id, f"已提交到 115：{label}\n保存目录：{save_path}")
 
-        if pushed:
-            await self.notify(chat_id, f"已推送 {len(pushed)} 个文件到 aria2：{root_name}")
-            return
+            try:
+                task_info = await self.run_blocking_stage(
+                    f"115 等待离线完成 {label}",
+                    self.open115.wait_offline_complete,
+                    magnet,
+                    self.settings.offline.timeout,
+                    self.settings.offline.poll_interval,
+                    save_path,
+                    timeout=self.settings.offline.timeout + self.runtime_health.blocking_stage_timeout,
+                )
+            except RuntimeFatalError:
+                raise
+            except Exception as exc:
+                if quiet_start:
+                    raise
+                logger.exception("wait offline complete failed")
+                await self.notify(chat_id, f"等待 115 离线完成失败：{label}\n原因：{_describe_failure_reason(save_path, exc)}")
+                return
 
-        if quiet_start:
-            raise RuntimeError("No files were pushed to aria2")
-        await self.notify(chat_id, f"115 已完成，但没有文件成功推送到 aria2：{root_name}")
+            root_name = task_info.name or "offline-task"
+            await self.notify(chat_id, f"115 离线已完成：{root_name}")
+
+            try:
+                if task_info.file_id:
+                    files = await self.run_blocking_stage(
+                        f"115 列出下载文件 {root_name}",
+                        self.open115.list_downloadable_files_by_id,
+                        task_info.file_id,
+                        root_name,
+                    )
+                else:
+                    resource_path = f"{save_path.rstrip('/')}/{root_name}"
+                    files = await self.run_blocking_stage(
+                        f"115 列出下载文件 {root_name}",
+                        self.open115.list_downloadable_files,
+                        resource_path,
+                    )
+                if not files:
+                    raise RuntimeError("115 离线完成后没有发现可下载文件")
+            except RuntimeFatalError:
+                raise
+            except Exception as exc:
+                if quiet_start:
+                    raise
+                logger.exception("list downloadable files failed")
+                await self.notify(chat_id, f"115 已完成，但读取文件列表失败：{root_name}\n原因：{exc}")
+                return
+
+            await self.notify(chat_id, f"正在推送到 aria2：{root_name}")
+
+            pushed: list[Aria2Task] = []
+            root_dir = Path(self.settings.aria2.download_path) / _safe_name(root_name)
+            for remote_file in files:
+                try:
+                    download_url = await self.run_blocking_stage(
+                        f"115 获取下载直链 {remote_file.name}",
+                        self.open115.get_download_url,
+                        remote_file.pick_code,
+                        timeout=max(self.runtime_health.blocking_stage_timeout, 420),
+                    )
+                except RuntimeFatalError:
+                    raise
+                except Exception as exc:
+                    logger.exception("get download url failed")
+                    await self.notify(chat_id, f"115 已完成，但获取下载直链失败：{remote_file.name}\n原因：{exc}")
+                    continue
+
+                try:
+                    relative_parent = Path(remote_file.relative_path).parent
+                    local_dir = root_dir if str(relative_parent) == "." else root_dir / relative_parent
+                    aria2_task = await self.run_blocking_stage(
+                        f"aria2 添加下载 {remote_file.name}",
+                        self.aria2.add_download,
+                        download_url,
+                        local_dir,
+                        remote_file.name,
+                        timeout=self.runtime_health.aria2_rpc_timeout,
+                    )
+                except RuntimeFatalError:
+                    raise
+                except Exception as exc:
+                    logger.exception("push to aria2 failed")
+                    await self.notify(chat_id, f"115 已完成，但推送 aria2 失败：{remote_file.name}\n原因：{exc}")
+                    continue
+
+                pushed.append(aria2_task)
+                child_task = asyncio.create_task(
+                    self._wait_aria2_and_send(chat_id, user_id, aria2_task, root_dir)
+                )
+                self._track_task(f"{task_id}-{aria2_task.gid}", child_task)
+
+            if pushed:
+                await self.notify(chat_id, f"已推送 {len(pushed)} 个文件到 aria2：{root_name}")
+                return
+
+            if quiet_start:
+                raise RuntimeError("No files were pushed to aria2")
+            await self.notify(chat_id, f"115 已完成，但没有文件成功推送到 aria2：{root_name}")
+        except RuntimeFatalError as exc:
+            logger.exception("offline pipeline stalled")
+            await self._notify_fatal_timeout(chat_id, exc)
+            raise
 
     async def _wait_aria2_and_send(
         self,
@@ -300,7 +404,12 @@ class TaskFlowService:
     ) -> None:
         try:
             while True:
-                status = await asyncio.to_thread(self.aria2.get_status, aria2_task.gid)
+                status = await self.run_blocking_stage(
+                    f"aria2 查询状态 {aria2_task.file_name}",
+                    self.aria2.get_status,
+                    aria2_task.gid,
+                    timeout=self.runtime_health.aria2_rpc_timeout,
+                )
                 if status["status"] == "complete":
                     break
                 if status["status"] in {"error", "removed"}:
@@ -311,10 +420,32 @@ class TaskFlowService:
                 raise FileNotFoundError(f"aria2 下载完成，但找不到文件: {aria2_task.local_path}")
 
             await self.notify(chat_id, f"文件已下载，正在发送到 Telegram：{aria2_task.file_name}")
-            target_label = await self.telegram_user.send_file(chat_id, user_id, aria2_task.local_path)
+            send_stage_key = self._stage_key(f"telethon-send-{aria2_task.gid}")
+
+            def _progress_callback(current: int, total: int) -> None:
+                if total <= 0 or current <= 0:
+                    return
+                self.touch_stage(send_stage_key)
+
+            target_label = await self.run_stage(
+                f"Telethon 发送文件 {aria2_task.file_name}",
+                self.telegram_user.send_file(
+                    chat_id,
+                    user_id,
+                    aria2_task.local_path,
+                    progress_callback=_progress_callback,
+                ),
+                stage_key=send_stage_key,
+                stall_timeout=self.runtime_health.telethon_stall_timeout,
+                absolute_timeout=None,
+            )
             aria2_task.local_path.unlink(missing_ok=True)
             _cleanup_empty_dirs(aria2_task.local_path.parent, root_dir)
             await self.notify(chat_id, f"已发送文件 {aria2_task.file_name} 到 {target_label}。")
+        except RuntimeFatalError as exc:
+            logger.exception("aria2 send pipeline stalled")
+            await self._notify_fatal_timeout(chat_id, exc)
+            raise
         except Exception as exc:
             logger.exception("aria2 send pipeline failed")
             message = str(exc) or exc.__class__.__name__
@@ -330,14 +461,34 @@ class TaskFlowService:
         try:
             if not self.bot:
                 raise RuntimeError("bot is not bound")
-            tg_file = await self.bot.get_file(ref.file_id)
-            downloaded_file = await tg_file.download_to_drive(custom_path=temp_path)
+            tg_file = await self.run_stage(
+                f"Bot 获取文件 {ref.file_name}",
+                self.bot.get_file(ref.file_id),
+                stall_timeout=self.runtime_health.telegram_transfer_timeout,
+                absolute_timeout=self.runtime_health.telegram_transfer_timeout,
+            )
+            downloaded_file = await self.run_stage(
+                f"Bot 下载文件 {ref.file_name}",
+                tg_file.download_to_drive(custom_path=temp_path),
+                stall_timeout=self.runtime_health.telegram_transfer_timeout,
+                absolute_timeout=self.runtime_health.telegram_transfer_timeout,
+            )
             await self.notify(ref.chat_id, f"正在上传 {downloaded_file.name} 到 115。")
-            uploaded, instant = await asyncio.to_thread(self.open115.upload_file, downloaded_file, save_path)
+            uploaded, instant = await self.run_blocking_stage(
+                f"115 上传文件 {downloaded_file.name}",
+                self.open115.upload_file,
+                downloaded_file,
+                save_path,
+                timeout=self.runtime_health.telegram_transfer_timeout,
+            )
             if not uploaded:
                 raise RuntimeError("115 上传失败")
             result_text = "秒传成功" if instant else "上传成功"
             await self.notify(ref.chat_id, f"{result_text}: {downloaded_file.name}\n保存目录: {save_path}")
+        except RuntimeFatalError as exc:
+            logger.exception("telegram upload pipeline stalled")
+            await self._notify_fatal_timeout(ref.chat_id, exc)
+            raise
         except Exception as exc:
             logger.exception("telegram upload pipeline failed")
             await self.notify(ref.chat_id, f"发送到 115 失败: {exc}")
@@ -350,6 +501,7 @@ class TaskFlowService:
         for attempt in range(3):
             try:
                 await self.bot.send_message(chat_id=chat_id, text=text)
+                self.runtime_health.mark_progress("bot notify ok")
                 return
             except (TimedOut, NetworkError):
                 if attempt == 2:
@@ -376,6 +528,16 @@ class TaskFlowService:
                 logger.error("Background task %s failed: %s", task_id, exc)
 
         return _callback
+
+    def _stage_key(self, prefix: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", prefix).strip("-").lower() or "stage"
+        return f"{normalized}:{uuid.uuid4().hex[:8]}"
+
+    async def _notify_fatal_timeout(self, chat_id: int, exc: RuntimeFatalError) -> None:
+        try:
+            await self.notify(chat_id, f"{exc}\n机器人将退出并等待 systemd 自动重启。")
+        except Exception:
+            logger.exception("Failed to send fatal timeout notification")
 
 
 def _safe_name(name: str) -> str:

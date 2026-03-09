@@ -5,18 +5,20 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from telegram.ext import Application
 
 from src.bot.handlers import post_init, register_bot_commands, register_handlers
 from src.config import Settings, load_settings
+from src.runtime import RuntimeHealth
 from src.services.aria2_rpc import Aria2RPCService
 from src.services.av_search import AVSearchService
 from src.services.open115 import Open115Client
 from src.services.task_flow import TaskFlowService
 from src.services.telegram_user import TelegramUserService
+from src.systemd_notify import SystemdNotifier
 
 
 def configure_logging() -> None:
@@ -27,21 +29,6 @@ def configure_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
 
-
-@dataclass(slots=True)
-class PollingHealth:
-    check_interval: int
-    failure_threshold: int
-    max_restart_failures: int
-    consecutive_failures: int = 0
-    restart_failures: int = 0
-    poll_error_count: int = 0
-    last_api_ok_at: float = 0.0
-    last_poll_error_at: float = 0.0
-    last_error: str = ""
-    restart_in_progress: bool = False
-
-
 async def main() -> None:
     configure_logging()
     default_config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
@@ -49,18 +36,36 @@ async def main() -> None:
     settings = load_settings(config_path)
     settings.apply_proxy_env()
     settings.ensure_directories()
+    _log_proxy_summary(settings)
+
+    runtime_health = RuntimeHealth(
+        check_interval=int(os.getenv("BOT_WATCHDOG_INTERVAL", "15")),
+        failure_threshold=int(os.getenv("BOT_WATCHDOG_FAILURE_THRESHOLD", "3")),
+        max_restart_failures=int(os.getenv("BOT_WATCHDOG_MAX_RESTART_FAILURES", "3")),
+        get_updates_stuck_timeout=int(os.getenv("BOT_GET_UPDATES_STUCK_TIMEOUT", "180")),
+        handler_timeout=int(os.getenv("BOT_HANDLER_TIMEOUT", "120")),
+        blocking_stage_timeout=int(os.getenv("BOT_BLOCKING_STAGE_TIMEOUT", "300")),
+        aria2_rpc_timeout=int(os.getenv("BOT_ARIA2_RPC_TIMEOUT", "15")),
+        telegram_transfer_timeout=int(os.getenv("BOT_TELEGRAM_TRANSFER_TIMEOUT", "3600")),
+        telethon_stall_timeout=int(os.getenv("BOT_TELETHON_STALL_TIMEOUT", "300")),
+        last_api_ok_at=time.monotonic(),
+        last_progress_at=time.monotonic(),
+    )
+    notifier = SystemdNotifier()
 
     open115 = Open115Client(settings)
     user_info = open115.get_user_info()
+    runtime_health.mark_progress("115 bootstrap ok")
 
     telegram_user = TelegramUserService(settings)
     await telegram_user.start()
     if not await telegram_user.ensure_authorized():
         raise RuntimeError(f"Telethon session is not authorized: {settings.session_file}")
+    runtime_health.mark_progress("telethon bootstrap ok")
 
     aria2 = Aria2RPCService(settings.aria2)
     av_search = AVSearchService()
-    flow = TaskFlowService(settings, open115, aria2, telegram_user, av_search)
+    flow = TaskFlowService(settings, open115, aria2, telegram_user, av_search, runtime_health)
 
     builder = (
         Application.builder()
@@ -79,49 +84,69 @@ async def main() -> None:
     if bot_proxy:
         builder = builder.proxy(bot_proxy).get_updates_proxy(bot_proxy)
     application = builder.build()
+    _wrap_get_updates(application, runtime_health)
     flow.bind_bot(application.bot)
     register_handlers(application, settings, flow, open115)
 
-    polling_health = PollingHealth(
-        check_interval=int(os.getenv("BOT_WATCHDOG_INTERVAL", "30")),
-        failure_threshold=int(os.getenv("BOT_WATCHDOG_FAILURE_THRESHOLD", "3")),
-        max_restart_failures=int(os.getenv("BOT_WATCHDOG_MAX_RESTART_FAILURES", "3")),
-        last_api_ok_at=time.monotonic(),
-    )
     polling_kwargs = {
         "timeout": 60,
         "bootstrap_retries": 3,
-        "error_callback": _make_polling_error_callback(polling_health),
+        "error_callback": _make_polling_error_callback(runtime_health),
     }
     watchdog_task: asyncio.Task | None = None
-    keepalive_task: asyncio.Task | None = None
+    fatal_wait_task: asyncio.Task | None = None
+    systemd_watchdog_task: asyncio.Task | None = None
 
     try:
         await application.initialize()
         await application.start()
+        await _startup_probe(application, aria2, runtime_health)
         allowed_chat_id = int(settings.allowed_user)
         await register_bot_commands(application, chat_id=allowed_chat_id)
         await _notify_startup(flow, allowed_chat_id, user_info)
         await application.updater.start_polling(**polling_kwargs)
+        runtime_health.mark_progress("updater polling started")
+        if notifier.enabled:
+            notifier.ready("telegram-115-bot running")
         watchdog_task = asyncio.create_task(
-            _polling_watchdog(application, flow, allowed_chat_id, polling_health, polling_kwargs),
+            _polling_watchdog(application, flow, allowed_chat_id, runtime_health, polling_kwargs),
             name="polling-watchdog",
         )
-        keepalive_task = asyncio.create_task(asyncio.Event().wait(), name="main-keepalive")
+        fatal_wait_task = asyncio.create_task(runtime_health.fatal_event.wait(), name="runtime-fatal")
+        if notifier.enabled:
+            systemd_watchdog_task = asyncio.create_task(
+                _systemd_watchdog(notifier, runtime_health),
+                name="systemd-watchdog",
+            )
+        wait_set = {watchdog_task, fatal_wait_task}
+        if systemd_watchdog_task:
+            wait_set.add(systemd_watchdog_task)
         done, pending = await asyncio.wait(
-            {watchdog_task, keepalive_task},
-            return_when=asyncio.FIRST_EXCEPTION,
+            wait_set,
+            return_when=asyncio.FIRST_COMPLETED,
         )
+        if fatal_wait_task in done and runtime_health.fatal_event.is_set():
+            raise RuntimeError(runtime_health.fatal_reason or runtime_health.stuck_reason or "runtime fatal error")
         for task in done:
+            if task is fatal_wait_task:
+                continue
             task.result()
         for task in pending:
             task.cancel()
     finally:
-        if keepalive_task:
-            keepalive_task.cancel()
+        if fatal_wait_task:
+            fatal_wait_task.cancel()
+        if systemd_watchdog_task:
+            systemd_watchdog_task.cancel()
+            await asyncio.gather(systemd_watchdog_task, return_exceptions=True)
         if watchdog_task:
             watchdog_task.cancel()
             await asyncio.gather(watchdog_task, return_exceptions=True)
+        if notifier.enabled:
+            try:
+                notifier.stopping("telegram-115-bot stopping")
+            except OSError:
+                logging.getLogger(__name__).warning("Failed to notify systemd about shutdown")
         if application.updater.running:
             await application.updater.stop()
         await application.stop()
@@ -169,15 +194,15 @@ def _stringify(value) -> str:
     return str(value)
 
 
-def _make_polling_error_callback(polling_health: PollingHealth):
+def _make_polling_error_callback(runtime_health: RuntimeHealth):
     def _callback(exc) -> None:
-        polling_health.poll_error_count += 1
-        polling_health.last_poll_error_at = time.monotonic()
-        polling_health.last_error = f"{exc.__class__.__name__}: {exc}"
+        runtime_health.poll_error_count += 1
+        runtime_health.last_poll_error_at = time.monotonic()
+        runtime_health.last_error = f"{exc.__class__.__name__}: {exc}"
         logging.getLogger(__name__).warning(
             "Telegram polling error #%s: %s",
-            polling_health.poll_error_count,
-            polling_health.last_error,
+            runtime_health.poll_error_count,
+            runtime_health.last_error,
         )
 
     return _callback
@@ -187,73 +212,96 @@ async def _polling_watchdog(
     application: Application,
     flow: TaskFlowService,
     chat_id: int,
-    polling_health: PollingHealth,
+    runtime_health: RuntimeHealth,
     polling_kwargs: dict,
 ) -> None:
     logger = logging.getLogger(__name__)
     while True:
-        await asyncio.sleep(polling_health.check_interval)
+        await asyncio.sleep(runtime_health.check_interval)
+        now = time.monotonic()
+        stalled_stage = runtime_health.get_stalled_stage(now)
+        if stalled_stage and stalled_stage.fatal:
+            stalled_for = int(now - stalled_stage.last_progress_at)
+            reason = (
+                f"{stalled_stage.label} 已无进度 {stalled_for} 秒，"
+                f"超过 {int(stalled_stage.timeout)} 秒"
+            )
+            runtime_health.mark_fatal(reason)
+            raise RuntimeError(reason)
+        if runtime_health.get_updates_in_progress:
+            elapsed = now - runtime_health.last_get_updates_started_at
+            if elapsed > runtime_health.get_updates_stuck_timeout:
+                reason = (
+                    f"Telegram getUpdates 已卡住 {int(elapsed)} 秒，"
+                    f"超过 {runtime_health.get_updates_stuck_timeout} 秒"
+                )
+                runtime_health.mark_fatal(reason)
+                raise RuntimeError(reason)
         try:
             await application.bot.get_me()
         except Exception as exc:
-            polling_health.consecutive_failures += 1
-            polling_health.last_error = f"{exc.__class__.__name__}: {exc}"
+            runtime_health.consecutive_failures += 1
+            runtime_health.last_error = f"{exc.__class__.__name__}: {exc}"
             logger.warning(
                 "Bot API healthcheck failed (%s/%s): %s",
-                polling_health.consecutive_failures,
-                polling_health.failure_threshold,
-                polling_health.last_error,
+                runtime_health.consecutive_failures,
+                runtime_health.failure_threshold,
+                runtime_health.last_error,
             )
-            if polling_health.consecutive_failures < polling_health.failure_threshold:
+            if runtime_health.consecutive_failures < runtime_health.failure_threshold:
                 continue
-            if polling_health.restart_in_progress:
+            if runtime_health.restart_in_progress:
                 continue
-            polling_health.restart_in_progress = True
+            runtime_health.restart_in_progress = True
             try:
                 await _restart_updater(application, polling_kwargs)
                 await application.bot.get_me()
             except Exception as restart_exc:
-                polling_health.restart_failures += 1
+                runtime_health.restart_failures += 1
                 logger.exception(
                     "Updater self-heal failed (%s/%s)",
-                    polling_health.restart_failures,
-                    polling_health.max_restart_failures,
+                    runtime_health.restart_failures,
+                    runtime_health.max_restart_failures,
                 )
-                if polling_health.restart_failures >= polling_health.max_restart_failures:
+                if runtime_health.restart_failures >= runtime_health.max_restart_failures:
                     raise RuntimeError(
                         "Telegram polling could not recover after repeated restart attempts"
                     ) from restart_exc
             else:
-                recovered_after = polling_health.consecutive_failures
+                recovered_after = runtime_health.consecutive_failures
                 logger.warning("Updater polling recovered after self-heal restart")
-                polling_health.consecutive_failures = 0
-                polling_health.restart_failures = 0
-                polling_health.last_api_ok_at = time.monotonic()
+                runtime_health.consecutive_failures = 0
+                runtime_health.restart_failures = 0
+                runtime_health.last_api_ok_at = time.monotonic()
+                runtime_health.clear_stuck()
+                runtime_health.mark_progress("updater self-heal ok")
                 await _notify_watchdog_event(
                     flow,
                     chat_id,
                     f"Bot 轮询已自动恢复，已重启 updater。\n恢复前连续失败次数：{recovered_after}",
                 )
             finally:
-                polling_health.restart_in_progress = False
+                runtime_health.restart_in_progress = False
         else:
-            if polling_health.consecutive_failures:
-                recovered_after = polling_health.consecutive_failures
+            if runtime_health.consecutive_failures:
+                recovered_after = runtime_health.consecutive_failures
                 logger.info("Bot API healthcheck recovered after %s failure(s)", recovered_after)
                 await _notify_watchdog_event(
                     flow,
                     chat_id,
                     f"Bot 网络已恢复。\n恢复前连续失败次数：{recovered_after}",
                 )
-            polling_health.consecutive_failures = 0
-            polling_health.restart_failures = 0
-            polling_health.last_api_ok_at = time.monotonic()
+            runtime_health.consecutive_failures = 0
+            runtime_health.restart_failures = 0
+            runtime_health.last_api_ok_at = time.monotonic()
+            runtime_health.mark_progress("bot api healthcheck ok")
 
 
 async def _restart_updater(application: Application, polling_kwargs: dict) -> None:
-    if application.updater.running:
-        await application.updater.stop()
-    await application.updater.start_polling(**polling_kwargs)
+    async with asyncio.timeout(60):
+        if application.updater.running:
+            await application.updater.stop()
+        await application.updater.start_polling(**polling_kwargs)
 
 
 async def _notify_watchdog_event(flow: TaskFlowService, chat_id: int, text: str) -> None:
@@ -261,6 +309,80 @@ async def _notify_watchdog_event(flow: TaskFlowService, chat_id: int, text: str)
         await flow.notify(chat_id, text)
     except Exception:
         logging.getLogger(__name__).exception("Failed to send watchdog notification")
+
+
+async def _startup_probe(
+    application: Application,
+    aria2: Aria2RPCService,
+    runtime_health: RuntimeHealth,
+) -> None:
+    await application.bot.get_me()
+    runtime_health.last_api_ok_at = time.monotonic()
+    runtime_health.mark_progress("bot api bootstrap ok")
+    if aria2.settings.enable:
+        async with asyncio.timeout(runtime_health.aria2_rpc_timeout):
+            await asyncio.to_thread(aria2.get_version, runtime_health.aria2_rpc_timeout)
+        runtime_health.mark_progress("aria2 bootstrap ok")
+
+
+async def _systemd_watchdog(notifier: SystemdNotifier, runtime_health: RuntimeHealth) -> None:
+    interval = notifier.watchdog_interval(default=30)
+    while True:
+        await asyncio.sleep(interval)
+        if runtime_health.fatal_event.is_set() or runtime_health.stuck_reason:
+            continue
+        notifier.watchdog(_systemd_status(runtime_health))
+
+
+def _wrap_get_updates(application: Application, runtime_health: RuntimeHealth) -> None:
+    original_get_updates = application.bot.get_updates
+
+    async def _wrapped_get_updates(*args, **kwargs):
+        runtime_health.mark_get_updates_start()
+        try:
+            updates = await original_get_updates(*args, **kwargs)
+        except Exception as exc:
+            runtime_health.last_error = f"get_updates failed: {exc.__class__.__name__}: {exc}"
+            raise
+        else:
+            runtime_health.mark_get_updates_end()
+            return updates
+        finally:
+            if runtime_health.get_updates_in_progress:
+                runtime_health.get_updates_in_progress = False
+
+    application.bot.get_updates = _wrapped_get_updates
+
+
+def _log_proxy_summary(settings: Settings) -> None:
+    logging.getLogger(__name__).info(
+        "Proxy summary: HTTP=%s HTTPS=%s NO_PROXY=%s",
+        _sanitize_proxy(settings.proxy.http),
+        _sanitize_proxy(settings.proxy.https),
+        settings.proxy.no_proxy or "-",
+    )
+
+
+def _sanitize_proxy(raw_proxy: str) -> str:
+    if not raw_proxy:
+        return "-"
+    normalized = raw_proxy if "://" in raw_proxy else f"http://{raw_proxy}"
+    parsed = urlparse(normalized)
+    if not parsed.hostname:
+        return raw_proxy
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
+def _systemd_status(runtime_health: RuntimeHealth) -> str:
+    last_error = runtime_health.last_error or "ok"
+    last_activity = runtime_health.last_activity or "-"
+    return (
+        "progress="
+        f"{int(time.monotonic() - runtime_health.last_progress_at)}s "
+        f"activity={last_activity} "
+        f"last_error={last_error}"
+    )
 
 
 if __name__ == "__main__":
