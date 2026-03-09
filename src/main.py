@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from telegram.ext import Application
+from telegram.ext import Application, ExtBot
+from telegram.request import HTTPXRequest
 
 from src.bot.handlers import post_init, register_bot_commands, register_handlers
 from src.config import Settings, load_settings
@@ -28,6 +29,27 @@ def configure_logging() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
+
+
+class TrackingExtBot(ExtBot):
+    def __init__(self, *args, runtime_health: RuntimeHealth, **kwargs) -> None:
+        self._runtime_health = runtime_health
+        super().__init__(*args, **kwargs)
+
+    async def get_updates(self, *args, **kwargs):
+        self._runtime_health.mark_get_updates_start()
+        try:
+            updates = await super().get_updates(*args, **kwargs)
+        except Exception as exc:
+            self._runtime_health.last_error = f"get_updates failed: {exc.__class__.__name__}: {exc}"
+            raise
+        else:
+            self._runtime_health.mark_get_updates_end()
+            return updates
+        finally:
+            if self._runtime_health.get_updates_in_progress:
+                self._runtime_health.get_updates_in_progress = False
+
 
 async def main() -> None:
     configure_logging()
@@ -66,25 +88,36 @@ async def main() -> None:
     aria2 = Aria2RPCService(settings.aria2)
     av_search = AVSearchService()
     flow = TaskFlowService(settings, open115, aria2, telegram_user, av_search, runtime_health)
-
+    bot_proxy = settings.proxy.https or settings.proxy.http
+    request = HTTPXRequest(
+        connection_pool_size=256,
+        connect_timeout=20,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=20,
+        proxy=bot_proxy or None,
+    )
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=1,
+        connect_timeout=20,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=20,
+        proxy=bot_proxy or None,
+    )
     builder = (
         Application.builder()
-        .token(settings.bot_token)
+        .bot(
+            TrackingExtBot(
+                token=settings.bot_token,
+                request=request,
+                get_updates_request=get_updates_request,
+                runtime_health=runtime_health,
+            )
+        )
         .post_init(post_init)
-        .connect_timeout(20)
-        .read_timeout(60)
-        .write_timeout(60)
-        .pool_timeout(20)
-        .get_updates_connect_timeout(20)
-        .get_updates_read_timeout(60)
-        .get_updates_write_timeout(60)
-        .get_updates_pool_timeout(20)
     )
-    bot_proxy = settings.proxy.https or settings.proxy.http
-    if bot_proxy:
-        builder = builder.proxy(bot_proxy).get_updates_proxy(bot_proxy)
     application = builder.build()
-    _wrap_get_updates(application, runtime_health)
     flow.bind_bot(application.bot)
     register_handlers(application, settings, flow, open115)
 
@@ -332,26 +365,6 @@ async def _systemd_watchdog(notifier: SystemdNotifier, runtime_health: RuntimeHe
         if runtime_health.fatal_event.is_set() or runtime_health.stuck_reason:
             continue
         notifier.watchdog(_systemd_status(runtime_health))
-
-
-def _wrap_get_updates(application: Application, runtime_health: RuntimeHealth) -> None:
-    original_get_updates = application.bot.get_updates
-
-    async def _wrapped_get_updates(*args, **kwargs):
-        runtime_health.mark_get_updates_start()
-        try:
-            updates = await original_get_updates(*args, **kwargs)
-        except Exception as exc:
-            runtime_health.last_error = f"get_updates failed: {exc.__class__.__name__}: {exc}"
-            raise
-        else:
-            runtime_health.mark_get_updates_end()
-            return updates
-        finally:
-            if runtime_health.get_updates_in_progress:
-                runtime_health.get_updates_in_progress = False
-
-    application.bot.get_updates = _wrapped_get_updates
 
 
 def _log_proxy_summary(settings: Settings) -> None:
