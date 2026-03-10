@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Iterable
 from urllib.parse import quote, urljoin
 import re
@@ -12,6 +13,7 @@ from requests import Response
 
 BASE_URL = "https://tiantianxiangshang.btchichi.hair"
 SEARCH_URL_TEMPLATE = BASE_URL + "/search/{query}/page-1.html"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -75,12 +77,25 @@ class AVSearchService:
             meta_tag = article.select_one("div > p")
             meta_text = meta_tag.get_text(" ", strip=True) if isinstance(meta_tag, Tag) else ""
             detail_url = urljoin(BASE_URL, link.get("href", ""))
+            hotness = self._extract_meta(meta_text, "熱度", "文件大小")
+            size = self._extract_meta(meta_text, "文件大小", "創建時間")
+            created_at = self._extract_meta(meta_text, "創建時間", "文件數量")
+            if not hotness or not size or not created_at:
+                logger.warning(
+                    "AV metadata parse incomplete: title=%r hotness=%r size=%r created_at=%r meta_text=%r detail_url=%s",
+                    self._extract_title(title_tag),
+                    hotness,
+                    size,
+                    created_at,
+                    meta_text,
+                    detail_url,
+                )
             yield SearchResult(
                 title=self._extract_title(title_tag),
                 magnet="",
-                size=self._extract_meta(meta_text, "文件大小", "創建時間"),
-                hotness=self._extract_meta(meta_text, "熱度", "文件大小"),
-                created_at=self._extract_meta(meta_text, "創建時間", "文件數量"),
+                size=size,
+                hotness=hotness,
+                created_at=created_at,
                 detail_url=detail_url,
             )
 
