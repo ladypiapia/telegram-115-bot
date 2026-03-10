@@ -267,8 +267,7 @@ class TaskFlowService:
         quiet_start: bool = False,
     ) -> None:
         try:
-            if not self.aria2.settings.enable:
-                raise RuntimeError("aria2 未启用，无法完成自动推送链路")
+            aria2_enabled = self.aria2.settings.enable
 
             if not quiet_start:
                 await self.notify(chat_id, f"正在提交到 115 离线：{label}")
@@ -313,6 +312,14 @@ class TaskFlowService:
 
             root_name = task_info.name or "offline-task"
             await self.notify(chat_id, f"115 离线已完成：{root_name}")
+
+            if not aria2_enabled:
+                if not quiet_start:
+                    await self.notify(
+                        chat_id,
+                        f"aria2 未启用，本次任务仅完成 115 离线。\n名称：{root_name}\n保存目录：{save_path}",
+                    )
+                return
 
             try:
                 if task_info.file_id:
