@@ -109,6 +109,22 @@ class RuntimeHealth:
                 return stage
         return None
 
+    def polling_stalled(self, now: float | None = None) -> bool:
+        current = now or time.monotonic()
+        if self.get_updates_in_progress:
+            return current - self.last_get_updates_started_at > self.get_updates_stuck_timeout
+        if self.last_get_updates_finished_at <= 0:
+            return False
+        return current - self.last_get_updates_finished_at > self.get_updates_stuck_timeout
+
+    def polling_age(self, now: float | None = None) -> float | None:
+        current = now or time.monotonic()
+        if self.get_updates_in_progress and self.last_get_updates_started_at > 0:
+            return current - self.last_get_updates_started_at
+        if self.last_get_updates_finished_at > 0:
+            return current - self.last_get_updates_finished_at
+        return None
+
     def mark_fatal(self, reason: str) -> None:
         self.fatal_reason = self.fatal_reason or reason
         self.stuck_reason = reason

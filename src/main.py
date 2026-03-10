@@ -97,7 +97,7 @@ async def main() -> None:
         proxy=bot_proxy or None,
     )
     get_updates_request = HTTPXRequest(
-        connection_pool_size=1,
+        connection_pool_size=int(os.getenv("BOT_GET_UPDATES_POOL_SIZE", "2")),
         connect_timeout=20,
         read_timeout=60,
         write_timeout=60,
@@ -285,6 +285,19 @@ async def _polling_watchdog(
             )
             if runtime_health.consecutive_failures < runtime_health.failure_threshold:
                 continue
+            if not runtime_health.polling_stalled(now):
+                poll_age = runtime_health.polling_age(now)
+                if poll_age is None:
+                    logger.warning(
+                        "Skipping updater self-heal restart because polling has not been marked stalled yet"
+                    )
+                else:
+                    logger.warning(
+                        "Skipping updater self-heal restart because getUpdates is still within timeout window (%ss < %ss)",
+                        int(poll_age),
+                        runtime_health.get_updates_stuck_timeout,
+                    )
+                continue
             if runtime_health.restart_in_progress:
                 continue
             runtime_health.restart_in_progress = True
@@ -321,11 +334,6 @@ async def _polling_watchdog(
             if runtime_health.consecutive_failures:
                 recovered_after = runtime_health.consecutive_failures
                 logger.info("Bot API healthcheck recovered after %s failure(s)", recovered_after)
-                await _notify_watchdog_event(
-                    flow,
-                    chat_id,
-                    f"Bot 网络已恢复。\n恢复前连续失败次数：{recovered_after}",
-                )
             runtime_health.consecutive_failures = 0
             runtime_health.restart_failures = 0
             runtime_health.last_api_ok_at = time.monotonic()
