@@ -102,8 +102,14 @@ class AVSearchService:
         return copied.get_text(" ", strip=True)
 
     def _decode_response(self, response: Response) -> str:
-        encoding = response.apparent_encoding or "utf-8"
-        return response.content.decode(encoding, errors="replace")
+        for encoding in ("utf-8", response.encoding, response.apparent_encoding, "gb18030"):
+            if not encoding:
+                continue
+            try:
+                return response.content.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return response.content.decode("utf-8", errors="replace")
 
     def _extract_meta(self, meta_text: str, label: str, next_label: str) -> str:
         label_variants = _META_LABELS.get(label, [label])
