@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import quote, urljoin
+import re
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -64,8 +65,7 @@ class AVSearchService:
         return SEARCH_URL_TEMPLATE.format(query=quote(query.strip(), safe=""))
 
     def _parse_results(self, response: Response) -> Iterable[SearchResult]:
-        response.encoding = response.encoding or response.apparent_encoding or "utf-8"
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(self._decode_response(response), "html.parser")
         for article in soup.select("article.item"):
             link = article.select_one('a[href^="/hash/"]')
             title_tag = article.select_one("h4")
@@ -87,8 +87,7 @@ class AVSearchService:
     def _fetch_magnet(self, detail_url: str) -> str | None:
         response = self.session.get(detail_url, timeout=self.timeout)
         response.raise_for_status()
-        response.encoding = response.encoding or response.apparent_encoding or "utf-8"
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(self._decode_response(response), "html.parser")
         magnet_tag = soup.select_one('a[href^="magnet:?xt=urn:btih:"]')
         if not isinstance(magnet_tag, Tag):
             return None
@@ -102,15 +101,26 @@ class AVSearchService:
             badge.decompose()
         return copied.get_text(" ", strip=True)
 
-    def _extract_meta(self, meta_text: str, label: str, next_label: str) -> str:
-        prefix = f"{label}："
-        start = meta_text.find(prefix)
-        if start < 0:
-            return ""
-        start += len(prefix)
+    def _decode_response(self, response: Response) -> str:
+        encoding = response.apparent_encoding or "utf-8"
+        return response.content.decode(encoding, errors="replace")
 
-        suffix = f"{next_label}："
-        end = meta_text.find(suffix, start)
-        if end < 0:
-            end = len(meta_text)
-        return meta_text[start:end].strip(" \u00a0")
+    def _extract_meta(self, meta_text: str, label: str, next_label: str) -> str:
+        label_variants = _META_LABELS.get(label, [label])
+        next_label_variants = _META_LABELS.get(next_label, [next_label])
+        normalized = " ".join(meta_text.replace("\xa0", " ").split())
+        for current in label_variants:
+            for following in next_label_variants:
+                pattern = rf"{re.escape(current)}[：:]\s*(.*?)\s*{re.escape(following)}[：:]"
+                matched = re.search(pattern, normalized)
+                if matched:
+                    return matched.group(1).strip()
+        return ""
+
+
+_META_LABELS = {
+    "熱度": ["熱度", "热度"],
+    "文件大小": ["文件大小"],
+    "創建時間": ["創建時間", "创建时间"],
+    "文件數量": ["文件數量", "文件数量"],
+}
