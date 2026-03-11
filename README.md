@@ -119,11 +119,19 @@ journalctl -u telegram-115-bot -f
 - `BOT_TELEGRAM_TRANSFER_TIMEOUT`，默认 `3600`
 - `BOT_TELETHON_STALL_TIMEOUT`，默认 `300`
 - `BOT_WATCHDOG_INTERVAL`，默认 `15`
+- `BOT_GET_UPDATES_POOL_SIZE`，默认 `2`
+- `BOT_HTTP_KEEPALIVE_EXPIRY`，默认 `30`
+- `BOT_HTTP_KEEPALIVE_CONNECTIONS`，默认 `32` 或连接池大小中的较小值
+- `BOT_TELETHON_PROXY`，默认沿用 `proxy.http` / `proxy.https`
+- `BOT_TELETHON_TIMEOUT`，默认 `15`
+- `BOT_TELETHON_REQUEST_RETRIES`，默认 `5`
+- `BOT_TELETHON_CONNECTION_RETRIES`，默认 `10`
+- `BOT_TELETHON_RETRY_DELAY`，默认 `5`
 
 ## 说明
 
 - 默认代理写成 `http://127.0.0.1:7890`，适配你服务器上的 mihomo。
-- 如果 mihomo 同时提供 SOCKS5 端口，优先改成 `socks5://127.0.0.1:<port>`。
+- 如果 mihomo 同时提供 SOCKS5 端口，优先把 `BOT_TELETHON_PROXY` 单独设成 `socks5://127.0.0.1:<port>`，Bot API 仍可继续用现有 HTTP 代理。
 - 如果 bot 是私聊使用，Telethon 回传的文件会发送到当前账号的 `Saved Messages`。
 - 本项目不做任务持久化，重启后不会恢复旧任务。
 

@@ -15,22 +15,33 @@ from src.config import Settings
 class TelegramUserService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.proxy = self._build_proxy()
         self.client = TelegramClient(
             str(settings.session_file),
             settings.tg_api_id,
             settings.tg_api_hash,
-            proxy=self._build_proxy(),
+            proxy=self.proxy,
+            timeout=float(os.getenv("BOT_TELETHON_TIMEOUT", "15")),
+            request_retries=int(os.getenv("BOT_TELETHON_REQUEST_RETRIES", "5")),
+            connection_retries=int(os.getenv("BOT_TELETHON_CONNECTION_RETRIES", "10")),
+            retry_delay=int(os.getenv("BOT_TELETHON_RETRY_DELAY", "5")),
+            auto_reconnect=True,
         )
 
     def _build_proxy(self) -> tuple | None:
-        raw_proxy = self.settings.proxy.http or self.settings.proxy.https
+        raw_proxy = os.getenv("BOT_TELETHON_PROXY") or self.settings.proxy.http or self.settings.proxy.https
         if not raw_proxy:
             return None
         normalized = raw_proxy if "://" in raw_proxy else f"http://{raw_proxy}"
         parsed = urlparse(normalized)
         if not parsed.hostname or not parsed.port:
             return None
-        proxy_type = socks.HTTP if parsed.scheme.startswith("http") else socks.SOCKS5
+        if parsed.scheme.startswith("socks5"):
+            proxy_type = socks.SOCKS5
+        elif parsed.scheme.startswith("socks4"):
+            proxy_type = socks.SOCKS4
+        else:
+            proxy_type = socks.HTTP
         return (
             proxy_type,
             parsed.hostname,

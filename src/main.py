@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
+
 from telegram.ext import Application, ExtBot
 from telegram.request import HTTPXRequest
 
@@ -29,6 +31,37 @@ def configure_logging() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
+
+
+def build_httpx_request(
+    *,
+    connection_pool_size: int,
+    proxy: str | None,
+    connect_timeout: float,
+    read_timeout: float,
+    write_timeout: float,
+    pool_timeout: float,
+) -> HTTPXRequest:
+    keepalive_expiry = float(os.getenv("BOT_HTTP_KEEPALIVE_EXPIRY", "30"))
+    keepalive_connections = int(
+        os.getenv("BOT_HTTP_KEEPALIVE_CONNECTIONS", str(min(connection_pool_size, 32)))
+    )
+    keepalive_connections = max(1, min(connection_pool_size, keepalive_connections))
+    return HTTPXRequest(
+        connection_pool_size=connection_pool_size,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
+        pool_timeout=pool_timeout,
+        proxy=proxy,
+        httpx_kwargs={
+            "limits": httpx.Limits(
+                max_connections=connection_pool_size,
+                max_keepalive_connections=keepalive_connections,
+                keepalive_expiry=keepalive_expiry,
+            )
+        },
+    )
 
 
 class TrackingExtBot(ExtBot):
@@ -88,21 +121,21 @@ async def main() -> None:
     av_search = AVSearchService()
     flow = TaskFlowService(settings, open115, aria2, telegram_user, av_search, runtime_health)
     bot_proxy = settings.proxy.https or settings.proxy.http
-    request = HTTPXRequest(
+    request = build_httpx_request(
         connection_pool_size=256,
+        proxy=bot_proxy or None,
         connect_timeout=20,
         read_timeout=60,
         write_timeout=60,
         pool_timeout=20,
-        proxy=bot_proxy or None,
     )
-    get_updates_request = HTTPXRequest(
+    get_updates_request = build_httpx_request(
         connection_pool_size=int(os.getenv("BOT_GET_UPDATES_POOL_SIZE", "2")),
+        proxy=bot_proxy or None,
         connect_timeout=20,
         read_timeout=60,
         write_timeout=60,
         pool_timeout=20,
-        proxy=bot_proxy or None,
     )
     builder = (
         Application.builder()
@@ -403,10 +436,12 @@ async def _systemd_watchdog(notifier: SystemdNotifier, runtime_health: RuntimeHe
 
 
 def _log_proxy_summary(settings: Settings) -> None:
+    telethon_proxy = os.getenv("BOT_TELETHON_PROXY") or settings.proxy.http or settings.proxy.https
     logging.getLogger(__name__).info(
-        "Proxy summary: HTTP=%s HTTPS=%s NO_PROXY=%s",
+        "Proxy summary: HTTP=%s HTTPS=%s TELETHON=%s NO_PROXY=%s",
         _sanitize_proxy(settings.proxy.http),
         _sanitize_proxy(settings.proxy.https),
+        _sanitize_proxy(telethon_proxy),
         settings.proxy.no_proxy or "-",
     )
 
